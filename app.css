@@ -1,6 +1,6 @@
 /* Layout: a field clipboard for phones — sticky top bar, one working column, a fixed action bar at the thumb; wider screens just get a roomier column. */
-@font-face { font-family: "Barlow Condensed"; font-weight: 600; font-display: swap; src: url("fonts/barlow-condensed-600.woff2") format("woff2"); }
-@font-face { font-family: "Barlow Condensed"; font-weight: 700; font-display: swap; src: url("fonts/barlow-condensed-700.woff2") format("woff2"); }
+@font-face { font-family: "Barlow Condensed"; font-weight: 600; font-display: swap; src: url("barlow-condensed-600.woff2") format("woff2"); }
+@font-face { font-family: "Barlow Condensed"; font-weight: 700; font-display: swap; src: url("barlow-condensed-700.woff2") format("woff2"); }
 
 :root {
   /* Lebaladna brand: sky blue + leaf green from the logo, Shelter grey for neutrals */

@@ -1,7 +1,7 @@
 /* Shelter Surveys – keeps the app available without internet.
  * Change VERSION whenever you upload new app files, so phones fetch the update.
  */
-const VERSION = 'shelter-v1.3.1';
+const VERSION = 'shelter-v1.4.0';
 const SHELL = [
   './',
   './index.html',
@@ -9,19 +9,24 @@ const SHELL = [
   './app.js',
   './config.js',
   './manifest.webmanifest',
-  './assets/shelter-logo.png',
-  './assets/lebaladna-logo.png',
-  './assets/icon-192.png',
-  './assets/icon-512.png',
-  './assets/icon-maskable-512.png',
-  './fonts/barlow-condensed-600.woff2',
-  './fonts/barlow-condensed-700.woff2',
-  './vendor/jspdf.umd.min.js',
-  './vendor/pptxgen.bundle.js'
+  './shelter-logo.png',
+  './lebaladna-logo.png',
+  './icon-192.png',
+  './icon-512.png',
+  './icon-maskable-512.png',
+  './barlow-condensed-600.woff2',
+  './barlow-condensed-700.woff2',
+  './jspdf.umd.min.js',
+  './pptxgen.bundle.js'
 ];
 
+// Save each file on its own: one missing file must not stop the rest from working offline.
 self.addEventListener('install', (event) => {
-  event.waitUntil(caches.open(VERSION).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));
+  event.waitUntil(
+    caches.open(VERSION)
+      .then((c) => Promise.all(SHELL.map((f) => c.add(new Request(f, { cache: 'reload' })).catch(() => null))))
+      .then(() => self.skipWaiting())
+  );
 });
 
 self.addEventListener('activate', (event) => {

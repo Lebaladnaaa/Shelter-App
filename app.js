@@ -7,12 +7,12 @@
   /* ═════════════════════ Config & constants ═════════════════════ */
   const CFG = Object.assign({ apiUrl: '', demo: false, assets: {} }, window.SHELTER_CONFIG || {});
   const ASSET = Object.assign({
-    shelterLogo: 'assets/shelter-logo.png',
-    lebaladnaLogo: 'assets/lebaladna-logo.png',
-    jspdf: 'vendor/jspdf.umd.min.js',
-    pptx: 'vendor/pptxgen.bundle.js'
+    shelterLogo: 'shelter-logo.png',
+    lebaladnaLogo: 'lebaladna-logo.png',
+    jspdf: 'jspdf.umd.min.js',
+    pptx: 'pptxgen.bundle.js'
   }, CFG.assets || {});
-  const APP_VERSION = '1.3.1';
+  const APP_VERSION = '1.4.0';
 
   const STATUSES = ['Draft', 'Submitted', 'Approved', 'Roofed', 'Cancelled'];
   const ROOM_NAMES = ['Bedroom', 'Kitchen', 'Bathroom', 'Hall', 'Reception', 'Stairs', 'Animal pen', 'Storage', 'Courtyard'];
@@ -279,7 +279,8 @@
     cur: null,
     stepOf: {},
     installPrompt: null,
-    invite: null
+    invite: null,
+    pendingDeletes: [] // surveys deleted on this phone, waiting to be deleted from the sheet
   };
   /** Google adds /u/0/, /u/1/… when several accounts are signed in; that form fails for everyone else. */
   const cleanApi = (u) => String(u || '').trim().replace(/\/macros\/u\/\d+\/s\//, '/macros/s/');
@@ -304,8 +305,29 @@
     scheduleSync(5000);
     updateSyncPill();
   }
+  /** Remove a survey and its photos from this phone only. */
+  async function removeLocal(id) {
+    const s = S.surveys.get(id);
+    S.surveys.delete(id);
+    S.list.picked.delete(id);
+    clearTimeout(saveTimers.get(id)); saveTimers.delete(id);
+    await DB.del('surveys', id).catch(() => {});
+    for (const p of (s && s.papers) || []) await DB.del('files', p.id).catch(() => {});
+    if (S.cur && S.cur.id === id) { S.cur = null; if (currentView === 'editor') { go(''); toast('This survey was deleted.'); } }
+  }
+  /** Delete everywhere: from this phone now, from the sheet (and so every other phone) on the next sync. */
+  async function deleteSurvey(s) {
+    if (!s.isNew && !S.pendingDeletes.some((d) => d.id === s.id)) {
+      S.pendingDeletes.push({ id: s.id, code: s.code || '', family: s.family || '' });
+      await DB.setMeta('pendingDeletes', S.pendingDeletes).catch(() => {});
+    }
+    await removeLocal(s.id);
+    go('');
+    toast('Deleted ' + (s.family || 'the survey'));
+    scheduleSync(300);
+  }
   function pendingCount() {
-    let n = 0;
+    let n = S.pendingDeletes.length;
     S.surveys.forEach((s) => {
       if (s.isNew) return;
       if (s.dirty) n++;
@@ -362,6 +384,7 @@
     S.sync.state = 'busy';
     updateSyncPill();
     try {
+      await pushDeletes();
       await pushSurveys();
       await pushPapers();
       await pull();
@@ -391,11 +414,26 @@
     return o;
   }
 
+  async function pushDeletes() {
+    while (S.pendingDeletes.length) {
+      const d = S.pendingDeletes[0];
+      await api('deleteSurvey', { id: d.id });
+      S.pendingDeletes.shift();
+      await DB.setMeta('pendingDeletes', S.pendingDeletes);
+    }
+  }
+
   async function pushSurveys() {
     const list = Array.from(S.surveys.values()).filter((s) => s.dirty && !s.isNew);
     for (const s of list) {
       const sentAt = s.updatedAt;
-      const res = await api('saveSurvey', { survey: surveyPayload(s), layout: s.layout, base: s.base || '' });
+      let res;
+      try {
+        res = await api('saveSurvey', { survey: surveyPayload(s), layout: s.layout, base: s.base || '' });
+      } catch (e) {
+        if (e.code === 'deleted') { await removeLocal(s.id); refreshAfterSync(s, false); continue; } // someone deleted it
+        throw e;
+      }
       const live = S.surveys.get(s.id);
       if (!live) continue;
       live.code = res.code;
@@ -420,6 +458,7 @@
           res = await api('uploadFile', { surveyId: s.id, fileId: p.id, paper: p.paper, name: p.name, mime: p.mime, data }, 120000);
         } catch (e) {
           if (e.code === 'survey_missing') { s.dirty = true; await DB.put('surveys', s); continue; }
+          if (e.code === 'deleted') { await removeLocal(s.id); break; }
           throw e;
         }
         p.status = 'uploaded';
@@ -463,7 +502,11 @@
     const res = await api('pull', { since: S.lastPull || '' }, 60000);
     await applyConfig(res);
     let changedCurrent = false;
+    // surveys someone deleted: remove them here too
+    for (const d of res.deleted || []) if (S.surveys.has(d.id)) await removeLocal(d.id);
+    const gone = new Set((res.deleted || []).map((d) => d.id).concat(S.pendingDeletes.map((d) => d.id)));
     for (const r of res.surveys || []) {
+      if (gone.has(r.id)) continue;
       const local = S.surveys.get(r.id);
       if (local && local.dirty) continue; // our newer edits win; they upload next round
       const pendingPapers = local ? (local.papers || []).filter((p) => p.status !== 'uploaded') : [];
@@ -563,7 +606,7 @@
     } else if (S.installPrompt) {
       body = '<b>Install the app</b><div>It opens without internet and keeps your surveys safe on this phone.</div><div class="btn-row"><button class="btn" data-act="install">Install app</button></div>';
     } else if (isAndroid()) {
-      body = '<b>Install on Android</b><ol><li>Open this page in <b>Chrome</b>.</li><li>Tap the <span class="kbd">⋮</span> menu at the top right.</li><li>Tap <span class="kbd">Install app</span> or <span class="kbd">Add to Home screen</span>.</li><li>Open <b>Shelter</b> from your home screen.</li></ol>';
+      body = '<b>Install on Android</b><ol><li>Open the browser menu (<span class="kbd">⋮</span> or <span class="kbd">☰</span>). This works in Chrome, Samsung Internet and Edge.</li><li>Tap <span class="kbd">Install app</span> or <span class="kbd">Add to Home screen</span>.</li><li>Open <b>Shelter</b> from your home screen. It opens as its own app, also without internet.</li></ol>';
     } else {
       body = '<b>Install on this computer</b><div>In Chrome or Edge, click the install icon at the right end of the address bar.</div>';
     }
@@ -659,7 +702,8 @@
       ['active', 'Active', count((s) => s.status !== 'Cancelled' && s.status !== 'Roofed')],
       ['mine', 'Mine', count((s) => (s.researcher || '').trim().toLowerCase() === (S.me.name || '').trim().toLowerCase())],
       ['all', 'All', all.length]
-    ].concat(STATUSES.map((st) => [st, st, count((s) => s.status === st)]));
+    ].concat(STATUSES.map((st) => [st, st, count((s) => s.status === st)]))
+      .filter((c) => c[0] !== 'Cancelled' || c[2] > 0); // cancelling = deleting now; show only if old ones exist
     const items = filteredSurveys();
     const sel = S.list.selecting;
     const hideInstall = lsGet('shelter-hide-install') === '1';
@@ -787,7 +831,7 @@
       field('age', 'Age', s, { attrs: ' inputmode="numeric"' }) +
       field('members', 'Family members', s, { attrs: ' inputmode="numeric"' }) +
       field('grade', 'Case grade', s, { options: [''].concat(GRADES) }) +
-      field('nationalId', 'National ID no.', s, { attrs: ' inputmode="numeric" autocomplete="off"', help: 'Kept in the sheet only. Not printed on exports.' }) +
+      field('nationalId', 'National ID no.', s, { attrs: ' inputmode="numeric" autocomplete="off"' }) +
       field('job', 'Job', s, { dir: true }) +
       field('income', 'Monthly income', s, { dir: true }) +
       '</div></section>' +
@@ -1155,7 +1199,7 @@
   function papersStep() {
     return '<section class="panel"><div class="panel-head"><h2>Papers</h2><span class="small muted">Photos upload when you have internet</span></div>' +
       '<div class="papers" id="papers"></div>' +
-      '<div class="small muted">Photos go to the team\'s private Google Drive folder. They are not printed on the PDF or PowerPoint.</div></section>';
+      '</section>';
   }
   function paperTypes(s) {
     const names = (S.config.papers || DEFAULT_PAPERS).map((p) => ({ name: p.name, required: !!p.required }));
@@ -1324,8 +1368,11 @@
       (s.status === 'Submitted' ? '<button class="btn leaf" data-setstatus="Approved">Approve</button><button class="btn ghost" data-setstatus="Draft">Send back to draft</button>' : '') +
       (s.status === 'Approved' ? '<button class="btn leaf" data-setstatus="Roofed">Mark as roofed</button><button class="btn ghost" data-setstatus="Submitted">Undo approval</button>' : '') +
       (s.status === 'Roofed' ? '<button class="btn ghost" data-setstatus="Approved">Back to approved</button>' : '') +
-      (s.status === 'Cancelled' ? '<button class="btn ghost" data-setstatus="Draft">Restore survey</button>' : '<button class="btn danger" data-act="cancel-survey">Cancel this survey</button>') +
-      '</div></section>';
+      (s.status === 'Cancelled' ? '<button class="btn ghost" data-setstatus="Draft">Restore survey</button>' : '') +
+      '<button class="btn danger" data-act="delete-survey">Delete survey</button>' +
+      '</div>' +
+      '<p class="small muted" style="margin:0">Delete removes it from the sheet and from every phone. Its photos go to the Google Drive trash, and the sheet keeps a copy in the “Deleted” tab.</p>' +
+      '</section>';
   }
 
   /* ── Wood rules (read from the sheet) ───────────────────────── */
@@ -2215,12 +2262,12 @@
         }
         break;
       }
-      case 'cancel-survey': {
+      case 'delete-survey': {
         if (!s) break;
-        if (removeArm.get('cancel')) { s.status = 'Cancelled'; touch(s); removeArm.delete('cancel'); renderEditor(s.id); }
+        if (removeArm.get('delete')) { removeArm.delete('delete'); deleteSurvey(s); }
         else {
-          removeArm.set('cancel', true); actEl.textContent = 'Tap again to cancel it';
-          setTimeout(() => { removeArm.delete('cancel'); if (actEl.isConnected) actEl.textContent = 'Cancel this survey'; }, 3500);
+          removeArm.set('delete', true); actEl.textContent = 'Tap again to delete it everywhere';
+          setTimeout(() => { removeArm.delete('delete'); if (actEl.isConnected) actEl.textContent = 'Delete survey'; }, 4000);
         }
         break;
       }
@@ -2326,6 +2373,7 @@
       if (cfg && cfg.rules) S.config = cfg;
       S.lastPull = (await DB.meta('lastPull')) || '';
       S.lastSyncAt = (await DB.meta('lastSyncAt')) || 0;
+      S.pendingDeletes = (await DB.meta('pendingDeletes')) || [];
       (await DB.all('surveys')).forEach((s) => { if (!s.isNew) S.surveys.set(s.id, s); });
     } catch (e) { /* start empty */ }
     readInvite();
