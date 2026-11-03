@@ -336,3 +336,67 @@ table.wood .sw { display: inline-block; width: 12px; height: 12px; border-radius
   .page.wide .page-inner, .appbar.wide .appbar-inner, .bottombar.wide .bottombar-inner { max-width: 1240px; }
   .page.wide .list { grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); align-items: start; }
 }
+
+/* ── Roles, implementation days, location (1.5) ─────────────────────────── */
+.st-Reviewed { background: color-mix(in srgb, var(--leaf) 14%, var(--brand-soft)); color: var(--brand); }
+.ro-set { border: 0; padding: 0; margin: 0; min-width: 0; display: grid; gap: 16px; }
+.ro-set:disabled input, .ro-set:disabled select, .ro-set:disabled textarea {
+  background: var(--sunk); color: var(--ink); -webkit-text-fill-color: var(--ink); opacity: 1; border-color: transparent;
+}
+.ro-set:disabled .toggle { cursor: default; }
+#plan.ro .room-g { cursor: pointer; touch-action: pan-y; }
+.status-row { align-items: center; }
+.status-pick { display: inline-flex; align-items: center; gap: 8px; margin-inline-start: auto; }
+.status-pick select { width: auto; min-height: 38px; padding-block: 4px; }
+.linkbtn { all: unset; color: var(--brand); font-weight: 650; text-decoration: underline; cursor: pointer; }
+.linkbtn:focus-visible { outline: 3px solid var(--brand); outline-offset: 2px; }
+
+.tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); overflow-x: auto; scrollbar-width: none; }
+.tabs::-webkit-scrollbar { display: none; }
+.tab {
+  flex: none; min-height: 44px; padding: 0 14px; border: 0; border-bottom: 3px solid transparent; background: transparent;
+  font-weight: 650; color: var(--muted); cursor: pointer; margin-bottom: -1px;
+}
+.tab[aria-current="page"] { color: var(--ink); border-bottom-color: var(--brand); }
+.list-title { font-size: 1.15rem; display: flex; gap: 8px; align-items: baseline; }
+
+.daytag, .loctag { display: inline-flex; align-items: center; gap: 4px; font-size: .74rem; font-weight: 600; color: var(--muted); max-width: 140px; }
+.daytag bdi { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.daytag svg, .loctag svg { width: 14px; height: 14px; flex: none; }
+.loctag { color: var(--leaf); }
+.day-card, .user-card { grid-template-columns: 1fr auto; }
+.user-card.off { opacity: .6; }
+.progress { height: 8px; border-radius: 99px; background: var(--sunk); overflow: hidden; margin-top: 4px; }
+.progress i { display: block; height: 100%; background: var(--leaf); border-radius: inherit; }
+.progress.big { height: 12px; }
+
+.houses { display: grid; gap: 10px; }
+.house { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 14px; display: grid; gap: 10px; }
+.house.roofed { background: color-mix(in srgb, var(--leaf-soft) 55%, var(--surface)); }
+.house-main { display: grid; gap: 4px; min-width: 0; }
+.house .fam { font-size: 1.08rem; font-weight: 650; overflow-wrap: anywhere; }
+.house .sub { font-size: .86rem; color: var(--muted); overflow-wrap: anywhere; }
+.house .nolocation { align-self: center; }
+@media (min-width: 640px) { .house { grid-template-columns: 1fr auto; align-items: center; } .house .btn-row { justify-content: flex-end; } }
+
+.pick-list { display: grid; gap: 8px; }
+.pick-row {
+  display: grid; grid-template-columns: auto 1fr auto; gap: 12px; align-items: start; padding: 12px; cursor: pointer;
+  border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface);
+}
+.pick-row.on { border-color: var(--leaf); background: color-mix(in srgb, var(--leaf-soft) 50%, var(--surface)); }
+.pick-row input { width: 22px; height: 22px; margin: 1px 0 0; accent-color: var(--leaf); }
+.pick-main { display: grid; gap: 2px; min-width: 0; }
+.pick-main b { overflow-wrap: anywhere; }
+.pick-main .sub { font-size: .84rem; color: var(--muted); overflow-wrap: anywhere; }
+.pick-main .warnline { color: var(--warn); }
+@media (min-width: 1000px) { .day-edit .pick-list { grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); } }
+
+.loc { display: grid; gap: 10px; }
+.loc-coords { display: grid; gap: 2px; }
+.loc-coords .data { font-size: 1.05rem; }
+.me-line { display: grid; gap: 2px; }
+.me-line b { font-size: 1.2rem; }
+.code-row { display: flex; gap: 8px; }
+.code-row input { flex: 1; min-width: 0; }
+.sheet .fields { gap: 12px; }

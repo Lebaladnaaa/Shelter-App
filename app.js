@@ -10,11 +10,13 @@
     shelterLogo: 'shelter-logo.png',
     lebaladnaLogo: 'lebaladna-logo.png',
     jspdf: 'jspdf.umd.min.js',
-    pptx: 'pptxgen.bundle.js'
+    pptx: 'pptxgen.bundle.js',
+    qr: 'qrcode.js'
   }, CFG.assets || {});
-  const APP_VERSION = '1.4.0';
+  const APP_VERSION = '1.5.0';
 
-  const STATUSES = ['Draft', 'Submitted', 'Approved', 'Roofed', 'Cancelled'];
+  const STATUSES = ['Draft', 'Submitted', 'Reviewed', 'Approved', 'Roofed', 'Cancelled'];
+  const ROLES = ['Admin', 'Manager', 'Team leader', 'Reviewer', 'Researcher'];
   const ROOM_NAMES = ['Bedroom', 'Kitchen', 'Bathroom', 'Hall', 'Reception', 'Stairs', 'Animal pen', 'Storage', 'Courtyard'];
   const GRADES = ['A', 'B+', 'B', 'C'];
   const ROOM_COLORS = [
@@ -117,7 +119,10 @@
     camera: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>',
     file: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>',
     share: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"/><path d="M16 6l-4-4-4 4"/><path d="M12 2v13"/></svg>',
-    download: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>'
+    download: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>',
+    pin: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s7-6.2 7-12a7 7 0 0 0-14 0c0 5.8 7 12 7 12z"/><circle cx="12" cy="10" r="2.5"/></svg>',
+    calendar: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4.5" width="18" height="16.5" rx="2"/><path d="M3 9.5h18M8 2.5v4M16 2.5v4"/></svg>',
+    check: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>'
   };
 
   /* ═════════════════════ Wood calculation (same rules as the sheet) ═════════════════════ */
@@ -280,11 +285,53 @@
     stepOf: {},
     installPrompt: null,
     invite: null,
-    pendingDeletes: [] // surveys deleted on this phone, waiting to be deleted from the sheet
+    pendingDeletes: [], // surveys deleted on this phone, waiting to be deleted from the sheet
+    pendingStates: [], // team leaders: Roofed / Pending marks waiting to upload
+    pendingTasks: [], // managers: implementation days saved or deleted, waiting to upload
+    tasks: [], // implementation days (managers: all; team leaders: theirs)
+    leaders: [], // team leaders, for managers planning a day
+    users: [], // admins: everyone, with codes
+    needLogin: '' // set when the sheet stops accepting this phone's code
   };
+
+  /* ═════════════════════ Roles: what this person may do ═════════════════════ */
+  const role = () => (S.me && S.me.role) || 'Researcher';
+  const isAdmin = () => role() === 'Admin';
+  const isMgr = () => role() === 'Admin' || role() === 'Manager';
+  const isLeader = () => role() === 'Team leader';
+  const normName = (v) => String(v == null ? '' : v).replace(/\s+/g, ' ').trim().toLowerCase();
+  function isOwner(s) {
+    if (s.createdById) return !!S.me && s.createdById === S.me.id;
+    if (!s.code && !s.base) return true; // made on this phone, not uploaded yet
+    return !!s.researcher && !!S.me && normName(s.researcher) === normName(S.me.name);
+  }
+  /** Same rules as the sheet: who may change a survey's family, rooms, plan and papers. */
+  function canEdit(s) {
+    if (!s || CFG.demo) return !!s;
+    if (isMgr()) return true;
+    if (role() === 'Reviewer') return s.status !== 'Roofed';
+    if (role() === 'Researcher') return isOwner(s) && (!s.status || s.status === 'Draft' || s.status === 'Submitted');
+    return false;
+  }
+  function canDelete(s) {
+    if (CFG.demo || isMgr()) return true;
+    if (role() === 'Researcher' || role() === 'Reviewer') return isOwner(s) && s.status !== 'Approved' && s.status !== 'Roofed';
+    return false;
+  }
+  const canAddPapers = (s) => canEdit(s) || (!isLeader() && isOwner(s));
+  function whyReadOnly(s) {
+    if (isLeader()) return 'View only. Team leaders see the drawing and mark houses roofed.';
+    if (role() === 'Researcher' && !isOwner(s)) return 'View only. Surveyed by ' + (s.researcher || 'someone else') + '; only they, reviewers and managers can change it.';
+    if (role() === 'Researcher') return 'View only. It is ' + (s.status || '').toLowerCase() + ', so only reviewers and managers can change it now.';
+    if (s.status === 'Roofed') return 'View only. This house is roofed; only managers can change it.';
+    return 'View only.';
+  }
+  const taskOf = (s) => S.tasks.find((t) => (t.surveyIds || []).indexOf(s.id) >= 0) || null;
   /** Google adds /u/0/, /u/1/… when several accounts are signed in; that form fails for everyone else. */
+  const normCodeLocal = (v) => String(v == null ? '' : v).replace(/[\s\-_.]+/g, '').toLowerCase();
   const cleanApi = (u) => String(u || '').trim().replace(/\/macros\/u\/\d+\/s\//, '/macros/s/');
-  const apiUrl = () => cleanApi((S.me && S.me.api) || CFG.apiUrl || '');
+  // config.js wins: change the link there once and every phone follows the next time it opens online
+  const apiUrl = () => cleanApi(CFG.apiUrl || (S.me && S.me.api) || '');
   const curSurvey = () => (S.cur ? S.surveys.get(S.cur.id) : null);
 
   const saveTimers = new Map();
@@ -327,7 +374,7 @@
     scheduleSync(300);
   }
   function pendingCount() {
-    let n = S.pendingDeletes.length;
+    let n = S.pendingDeletes.length + S.pendingStates.length + S.pendingTasks.length;
     S.surveys.forEach((s) => {
       if (s.isNew) return;
       if (s.dirty) n++;
@@ -368,7 +415,10 @@
       throw err;
     }
     if (!j.ok) {
-      const err = new Error(j.message || j.error || 'Sheet error');
+      const msg = j.error === 'unknown_action'
+        ? 'The sheet is running older code than the app. In Apps Script: Deploy → Manage deployments → ✏️ → Version: New version → Deploy. Nothing is lost; it uploads after that.'
+        : (j.message || j.error || 'Sheet error');
+      const err = new Error(msg);
       err.code = j.error || 'error';
       throw err;
     }
@@ -377,7 +427,7 @@
 
   async function syncNow() {
     clearTimeout(syncTimer);
-    if (CFG.demo || !S.me || !apiUrl() || !S.me.key) { updateSyncPill(); return; }
+    if (CFG.demo || !S.me || !S.me.role || S.needLogin || !apiUrl() || !S.me.key) { updateSyncPill(); return; }
     if (syncing) { syncAgain = true; return; }
     if (navigator.onLine === false) { S.sync.state = 'offline'; updateSyncPill(); return; }
     syncing = true;
@@ -387,13 +437,19 @@
       await pushDeletes();
       await pushSurveys();
       await pushPapers();
+      await pushStates();
+      await pushTasks();
       await pull();
-      S.sync = { state: 'ok', msg: '' };
+      S.sync = deleteProblem ? { state: 'error', msg: deleteProblem } : { state: 'ok', msg: '' };
       S.lastSyncAt = Date.now();
       DB.setMeta('lastSyncAt', S.lastSyncAt).catch(() => {});
     } catch (e) {
       if (e.code === 'offline') S.sync = { state: 'offline', msg: e.message };
-      else if (e.code === 'bad_key') S.sync = { state: 'badkey', msg: 'The team code on this phone is not accepted. Ask your team lead for the current code and change it in Settings.' };
+      else if (e.code === 'bad_key') {
+        S.sync = { state: 'badkey', msg: 'Your code is no longer accepted. Ask an admin for your code and enter it again. Nothing on this phone is lost.' };
+        S.needLogin = 'Your code has changed or was switched off. Enter your personal code to continue. Nothing on this phone is lost.';
+        setTimeout(route, 0);
+      }
       else if (e.code === 'busy') { S.sync = { state: 'wait', msg: 'The sheet was busy. Trying again shortly.' }; scheduleSync(8000); }
       else S.sync = { state: 'error', msg: e.message || String(e) };
     } finally {
@@ -405,19 +461,65 @@
   }
 
   function surveyPayload(s) {
-    const keys = ['id', 'code', 'status', 'project', 'area', 'researcher', 'reviewer', 'date', 'family', 'age', 'members',
-      'grade', 'nationalId', 'job', 'income', 'mobile', 'notes', 'createdAt', 'deviceId'];
+    const keys = ['id', 'code', 'status', 'project', 'area', 'date', 'family', 'age', 'members',
+      'grade', 'nationalId', 'job', 'income', 'mobile', 'notes', 'createdAt', 'deviceId', 'location'];
     const o = {};
     keys.forEach((k) => { if (s[k] != null) o[k] = s[k]; });
+    if (s.locationCleared && !s.location) o.locationCleared = true;
     o.rooms = (s.rooms || []).map((r) => ({ id: r.id, name: r.name, grade: r.grade, roof: !!r.roof, beamSide: r.beamSide, plankSide: r.plankSide, color: r.color }));
     o.updatedBy = S.me.name;
     return o;
   }
 
+  /** Team leaders' Roofed / Pending marks, also made offline. */
+  async function pushStates() {
+    while (S.pendingStates.length) {
+      const st = S.pendingStates[0];
+      try {
+        const res = await api('setHouseState', { surveyId: st.surveyId, state: st.state });
+        const live = S.surveys.get(st.surveyId);
+        if (live) { live.status = res.status; live.base = res.updatedAt; await DB.put('surveys', live); }
+      } catch (e) {
+        if (e.code === 'offline' || e.code === 'busy' || e.code === 'bad_key') throw e;
+        toast(e.message || 'That mark could not be saved.', 4000); // not allowed any more: the next sync shows the truth
+      }
+      S.pendingStates.shift();
+      await DB.setMeta('pendingStates', S.pendingStates);
+    }
+  }
+
+  /** Managers' implementation days, also planned offline. */
+  async function pushTasks() {
+    while (S.pendingTasks.length) {
+      const op = S.pendingTasks[0];
+      try {
+        if (op.op === 'delete') await api('deleteTask', { id: op.id });
+        else {
+          const res = await api('saveTask', { task: op.task });
+          if (res.skipped) toast(res.skipped + ' house(s) were not approved any more and were left out.', 4500);
+        }
+      } catch (e) {
+        if (e.code === 'offline' || e.code === 'busy' || e.code === 'bad_key') throw e;
+        toast(e.message || 'The implementation day could not be saved.', 4500);
+      }
+      S.pendingTasks.shift();
+      await DB.setMeta('pendingTasks', S.pendingTasks);
+    }
+  }
+
+  let deleteProblem = '';
+  /** Send waiting deletes. A delete the sheet refuses stays waiting, but never blocks surveys from uploading. */
   async function pushDeletes() {
+    deleteProblem = '';
     while (S.pendingDeletes.length) {
       const d = S.pendingDeletes[0];
-      await api('deleteSurvey', { id: d.id });
+      try {
+        await api('deleteSurvey', { id: d.id });
+      } catch (e) {
+        if (e.code === 'offline' || e.code === 'busy' || e.code === 'bad_key') throw e;
+        deleteProblem = 'A delete is waiting. ' + e.message;
+        return;
+      }
       S.pendingDeletes.shift();
       await DB.setMeta('pendingDeletes', S.pendingDeletes);
     }
@@ -432,12 +534,19 @@
         res = await api('saveSurvey', { survey: surveyPayload(s), layout: s.layout, base: s.base || '' });
       } catch (e) {
         if (e.code === 'deleted') { await removeLocal(s.id); refreshAfterSync(s, false); continue; } // someone deleted it
+        if (e.code === 'not_allowed') { // e.g. it was reviewed meanwhile: keep the sheet's version
+          s.dirty = false; S.lastPull = '';
+          toast((s.family || 'A survey') + ': ' + e.message + ' The sheet\'s version is kept.', 5000);
+          continue;
+        }
         throw e;
       }
       const live = S.surveys.get(s.id);
       if (!live) continue;
       live.code = res.code;
       live.base = res.updatedAt;
+      ['researcher', 'createdById', 'reviewer', 'approvedBy'].forEach((k) => { if (res[k] != null) live[k] = res[k]; });
+      live.locationCleared = false;
       if (res.status && res.status !== live.status) live.status = res.status;
       if (live.updatedAt === sentAt) live.dirty = false;
       await DB.put('surveys', live);
@@ -498,14 +607,46 @@
     }
   }
 
+  /** The sheet tells us who we are on every sync: an admin may have changed our role or name. */
+  async function applyMe(res) {
+    if (!res || !res.me || !S.me) return;
+    const was = S.me.role;
+    S.me = Object.assign({}, S.me, { id: res.me.id, name: res.me.name, role: res.me.role });
+    await DB.setMeta('me', S.me);
+    if (was && was !== S.me.role) { S.lastPull = ''; toast('Your role is now: ' + S.me.role); setTimeout(route, 0); }
+  }
+
+  async function applyTeam(res) {
+    if (res.leaders) { S.leaders = res.leaders; await DB.setMeta('leaders', S.leaders); }
+    if (res.users) { S.users = res.users; await DB.setMeta('users', S.users); }
+    if (res.tasks) {
+      // keep days saved here that haven't uploaded yet
+      const waiting = new Map(S.pendingTasks.filter((o) => o.op === 'save').map((o) => [o.task.id, o.task]));
+      const deleting = new Set(S.pendingTasks.filter((o) => o.op === 'delete').map((o) => o.id));
+      const list = res.tasks.filter((t) => !deleting.has(t.id)).map((t) => waiting.get(t.id) || t);
+      waiting.forEach((t, id) => { if (!list.some((x) => x.id === id)) list.push(t); });
+      S.tasks = list;
+      await DB.setMeta('tasks', S.tasks);
+    } else if (!isMgr() && !isLeader()) S.tasks = [];
+  }
+
   async function pull() {
     const res = await api('pull', { since: S.lastPull || '' }, 60000);
     await applyConfig(res);
+    await applyMe(res);
+    await applyTeam(res);
     let changedCurrent = false;
     // surveys someone deleted: remove them here too
     for (const d of res.deleted || []) if (S.surveys.has(d.id)) await removeLocal(d.id);
+    // a full list (first sync, or a team leader): anything not in it is gone for this person
+    if (res.full) {
+      const keep = new Set((res.surveys || []).map((r) => r.id));
+      for (const s of Array.from(S.surveys.values())) if (!keep.has(s.id) && !s.isNew && !s.dirty && s.base) await removeLocal(s.id);
+    }
     const gone = new Set((res.deleted || []).map((d) => d.id).concat(S.pendingDeletes.map((d) => d.id)));
+    const waitingState = new Map(S.pendingStates.map((x) => [x.surveyId, x.state]));
     for (const r of res.surveys || []) {
+      if (waitingState.has(r.id)) r.status = waitingState.get(r.id) === 'Roofed' ? 'Roofed' : 'Approved';
       if (gone.has(r.id)) continue;
       const local = S.surveys.get(r.id);
       if (local && local.dirty) continue; // our newer edits win; they upload next round
@@ -526,6 +667,7 @@
     S.lastPull = res.serverTime || S.lastPull;
     await DB.setMeta('lastPull', S.lastPull);
     if (!S.cur && currentView === 'list') keepFocus(renderList);
+    if (!S.cur && (currentView === 'days' || currentView === 'users' || (currentView === 'day' && !isMgr()))) keepFocus(route);
     if (changedCurrent && currentView === 'editor') {
       const a = document.activeElement;
       if (!a || !/INPUT|TEXTAREA|SELECT/.test(a.tagName)) renderEditor(S.cur.id);
@@ -574,23 +716,41 @@
 
   function route() {
     const h = decodeURIComponent(location.hash.replace(/^#/, ''));
-    const ready = S.me && S.me.name && (CFG.demo || (S.me.key && apiUrl()));
-    if (!ready) { renderWelcome(); return; }
+    const ready = S.me && S.me.name && S.me.role && !S.needLogin && (CFG.demo || (S.me.key && apiUrl()));
+    if (!ready || (S.invite && S.invite.code)) { renderWelcome(); return; }
     if (h.indexOf('survey-') === 0) {
       const id = h.slice(7);
       if (S.surveys.has(id)) { renderEditor(id); return; }
       location.replace('#');
       return;
     }
+    if (h.indexOf('day-') === 0 && (isMgr() || isLeader())) {
+      const id = h.slice(4);
+      if (id === 'new' && isMgr()) { renderDay(null); return; }
+      if (S.tasks.some((t) => t.id === id)) { renderDay(id); return; }
+      location.replace('#days');
+      return;
+    }
+    if (h === 'days' && (isMgr() || isLeader())) { renderDays(); return; }
+    if (h === 'users' && isAdmin()) { renderUsers(); return; }
     if (h === 'rules') { renderRules(); return; }
     if (h === 'me') { renderMe(); return; }
+    if (isLeader()) { renderDays(); return; } // team leaders work from their implementation days
     renderList();
+  }
+
+  /** Managers and admins switch between surveys, implementation days and users. */
+  function navTabs(active) {
+    if (!isMgr()) return '';
+    const tabs = [['', 'Surveys'], ['days', 'Implementation days']].concat(isAdmin() ? [['users', 'Users']] : []);
+    return '<nav class="tabs" aria-label="Sections">' + tabs.map((t) =>
+      '<button class="tab" data-go="' + t[0] + '"' + (active === t[0] ? ' aria-current="page"' : '') + '>' + esc(t[1]) + '</button>').join('') + '</nav>';
   }
   const go = (hash) => { if (location.hash.replace('#', '') === hash) route(); else location.hash = hash; };
 
   function appbar(opts) {
     const left = opts.back
-      ? '<button class="iconbtn" data-act="back" aria-label="Back to surveys">' + ICON.back + '</button>'
+      ? '<button class="iconbtn" data-act="' + (opts.backAct || 'back') + '" aria-label="Back">' + ICON.back + '</button>'
       : '<img class="logo" src="' + esc(ASSET.shelterLogo) + '" alt="Shelter team logo">';
     return '<header class="appbar' + (opts.wide ? ' wide' : '') + '"><div class="appbar-inner">' + left +
       '<div class="titles"><span class="eyebrow" id="eyebrow">' + esc(opts.eyebrow || '') + '</span><h1 dir="auto" id="title">' + esc(opts.title) + '</h1></div>' +
@@ -623,40 +783,52 @@
       '<main class="page"><div class="welcome">' +
       '<div class="logos"><img src="' + esc(ASSET.shelterLogo) + '" alt="Shelter team"><img src="' + esc(ASSET.lebaladnaLogo) + '" alt="Lebaladna"></div>' +
       '<div><span class="eyebrow muted small">Lebaladna · Shelter team</span><h1>Shelter Surveys</h1><p class="muted">Record each house, its rooms and papers. Works without internet and uploads to the team sheet when you are back online.</p></div>' +
+      (S.needLogin ? '<div class="notice warn"><div>' + esc(S.needLogin) + '</div></div>' : '') +
       installHelp(false) +
       '<form class="panel" id="welcomeForm" novalidate>' +
       '<div class="fields">' +
-      '<label class="field wide"><span>Your name</span><input type="text" id="w-name" autocomplete="name" value="' + esc(me.name || '') + '" required></label>' +
-      '<label class="field wide"><span>Team code</span><input type="text" id="w-key" autocapitalize="off" autocomplete="off" value="' + esc(inv.team || me.key || '') + '" required><small>Your team lead gives you this code.</small></label>' +
-      '<label class="field wide"' + (needApi ? '' : ' hidden') + '><span>Sheet connection link</span><input type="url" id="w-api" inputmode="url" autocapitalize="off" value="' + esc(inv.api || me.api || '') + '" placeholder="https://script.google.com/macros/s/…/exec"><small>Only needed if your lead did not send you an invite link.</small></label>' +
+      '<label class="field wide"><span>Your personal code</span><input type="text" id="w-key" autocapitalize="off" autocomplete="off" value="' + esc(inv.code || '') + '" required><small>An admin gives each person their own code. It tells the app who you are and what you can do.</small></label>' +
+      '<label class="field wide"' + (needApi ? '' : ' hidden') + '><span>Sheet connection link</span><input type="url" id="w-api" inputmode="url" autocapitalize="off" value="' + esc(inv.api || me.api || '') + '" placeholder="https://script.google.com/macros/s/…/exec"><small>Only needed if you did not get an invite link.</small></label>' +
       '</div>' +
       '<div id="w-msg"></div>' +
-      '<div class="btn-row"><button class="btn" type="submit" id="w-go">Start</button></div>' +
+      '<div class="btn-row"><button class="btn" type="submit" id="w-go">Log in</button>' +
+      (S.invite && S.invite.code && me.role && !S.needLogin ? '<button type="button" class="btn quiet" data-act="cancel-invite">Stay logged in as <bdi>' + esc(me.name) + '</bdi></button>' : '') + '</div>' +
+      '<p class="small muted" style="margin:0">The first log-in needs internet. After that the app works offline.</p>' +
       '</form></div></main>';
     $('#welcomeForm').addEventListener('submit', async (e) => {
       e.preventDefault();
-      const name = $('#w-name').value.trim();
       const key = $('#w-key').value.trim();
-      const link = ($('#w-api').value.trim() || CFG.apiUrl || '').trim();
+      const link = cleanApi($('#w-api').value.trim() || CFG.apiUrl || '');
       const msg = $('#w-msg');
-      $('#w-name').classList.toggle('bad', !name);
       $('#w-key').classList.toggle('bad', !key);
-      if (!name || !key) { msg.innerHTML = '<div class="notice err">Add your name and the team code.</div>'; return; }
-      if (!link) { msg.innerHTML = '<div class="notice err">Paste the sheet connection link your lead sent you.</div>'; return; }
-      S.me = Object.assign({ deviceId: uid() }, S.me || {}, { name, key, api: link });
+      if (!key) { msg.innerHTML = '<div class="notice err">Type your personal code.</div>'; return; }
+      if (!link) { msg.innerHTML = '<div class="notice err">Paste the sheet connection link from your invite.</div>'; return; }
+      const before = S.me;
+      S.me = Object.assign({ deviceId: uid() }, S.me || {}, { key, api: link });
       $('#w-go').disabled = true;
-      msg.innerHTML = '<div class="notice info">Checking the team code…</div>';
+      msg.innerHTML = '<div class="notice info">Checking your code…</div>';
       try {
         const res = await api('ping', {}, 20000);
         await applyConfig(res);
+        S.me = Object.assign({}, S.me, { id: res.me.id, name: res.me.name, role: res.me.role });
+        if (!before || !before.id || before.id !== S.me.id) { // first log-in, or a different person on this phone: download everything again
+          S.lastPull = ''; await DB.setMeta('lastPull', '');
+          S.tasks = []; S.users = []; S.leaders = [];
+        }
+        await applyTeam(res);
       } catch (err) {
+        S.me = before;
         $('#w-go').disabled = false;
-        if (err.code === 'bad_key') { msg.innerHTML = '<div class="notice err">That team code is not accepted. Check it with your team lead.</div>'; return; }
-        if (err.code !== 'offline') { msg.innerHTML = '<div class="notice err">' + esc(err.message) + '</div>'; return; }
-        toast('No internet now. The app will check the code when you are online.', 4000);
+        if (err.code === 'bad_key') { msg.innerHTML = '<div class="notice err">That code is not accepted. Check it with an admin.</div>'; return; }
+        if (err.code === 'offline') { msg.innerHTML = '<div class="notice err">No internet. The first log-in needs internet once.</div>'; return; }
+        msg.innerHTML = '<div class="notice err">' + esc(err.message) + '</div>';
+        return;
       }
       await DB.setMeta('me', S.me);
       S.invite = null;
+      S.needLogin = '';
+      S.sync = { state: 'idle', msg: '' };
+      toast('Welcome, ' + S.me.name + ' (' + S.me.role + ')');
       go('');
       scheduleSync(300);
     });
@@ -700,27 +872,29 @@
     const count = (fn) => all.filter(fn).length;
     const chips = [
       ['active', 'Active', count((s) => s.status !== 'Cancelled' && s.status !== 'Roofed')],
-      ['mine', 'Mine', count((s) => (s.researcher || '').trim().toLowerCase() === (S.me.name || '').trim().toLowerCase())],
+      ['mine', 'Mine', count((s) => isOwner(s))],
       ['all', 'All', all.length]
     ].concat(STATUSES.map((st) => [st, st, count((s) => s.status === st)]))
       .filter((c) => c[0] !== 'Cancelled' || c[2] > 0); // cancelling = deleting now; show only if old ones exist
     const items = filteredSurveys();
-    const sel = S.list.selecting;
+    const sel = S.list.selecting && isMgr();
     const hideInstall = lsGet('shelter-hide-install') === '1';
     const rulesNote = S.config.rules && S.config.rules.example
       ? '<div class="notice warn"><div><b>Wood rules are still the examples.</b> Set your team\'s rounding in the Google Sheet, tab “Wood rules”.</div><div class="btn-row"><button class="btn ghost sm" data-act="go-rules">See wood rules</button></div></div>' : '';
 
     app().innerHTML = appbar({
-      eyebrow: 'Lebaladna · Shelter', title: 'Surveys', wide: true,
+      eyebrow: 'Lebaladna · Shelter · ' + (S.me.name || '') + ' (' + role() + ')', title: 'Surveys', wide: true,
       actions: '<button class="iconbtn" data-act="go-rules" aria-label="Wood rules">' + ICON.wood + '</button><button class="iconbtn" data-act="go-me" aria-label="Settings">' + ICON.gear + '</button>'
     }) +
       '<main class="page wide' + (sel ? ' selecting' : '') + '"><div class="page-inner">' +
+      navTabs('') +
       (CFG.demo ? '<div class="notice info small"><div><b>Preview.</b> Try it with the example house or a new survey. Here surveys stay on this device only; the installed app uploads them to your Google Sheet.</div></div>' : '') +
       (hideInstall ? '' : installHelp(true)) +
       (DB.memoryOnly ? '<div class="notice err"><b>This browser cannot keep surveys offline.</b> Install the app or use Chrome / Safari normally (not a private window).</div>' : '') +
       rulesNote +
+      (role() === 'Reviewer' && count((s) => s.status === 'Submitted') ? '<div class="notice info small"><div><b>' + count((s) => s.status === 'Submitted') + ' submitted</b> waiting for review. <button class="linkbtn" data-filter="Submitted">Show them</button></div></div>' : '') +
       '<div class="search-row"><input type="search" id="q" dir="auto" placeholder="Search name, area, code, phone or ID" value="' + esc(S.list.q) + '" aria-label="Search surveys">' +
-      '<button class="btn ghost" data-act="toggle-select">' + (sel ? 'Done' : 'Select') + '</button></div>' +
+      (isMgr() ? '<button class="btn ghost" data-act="toggle-select">' + (sel ? 'Done' : 'Select') + '</button>' : '') + '</div>' +
       '<div class="chips" role="group" aria-label="Filter surveys">' + chips.map((c) =>
         '<button class="chip" data-filter="' + esc(c[0]) + '" aria-pressed="' + (S.list.filter === c[0]) + '">' + esc(c[1]) + ' <span class="count">' + c[2] + '</span></button>').join('') + '</div>' +
       '<div class="list" id="list">' + (items.length ? items.map(cardHtml).join('') : emptyHtml(all.length)) + '</div>' +
@@ -753,7 +927,9 @@
       '<div class="sub">' + bits.map((x) => '<bdi>' + esc(x) + '</bdi>').join(' · ') + '</div>' +
       (woodLine ? '<div class="wood">' + esc(woodLine) + '</div>' : '') + '</div>' +
       '<div class="side"><span class="status st-' + esc(s.status || 'Draft') + '">' + esc(s.status || 'Draft') + '</span>' +
-      (waiting ? '<span class="cloud">Not uploaded</span>' : '') + '</div></div>';
+      (waiting ? '<span class="cloud">Not uploaded</span>' : '') +
+      (isMgr() && taskOf(s) ? '<span class="daytag">' + ICON.calendar + '<bdi>' + esc(taskOf(s).name) + '</bdi></span>' : '') +
+      (hasLoc(s) ? '<span class="loctag" title="Location saved">' + ICON.pin + '</span>' : '') + '</div></div>';
   }
 
   function selectionBar() {
@@ -771,7 +947,7 @@
 
   function newSurvey() {
     const s = {
-      id: uid(), code: '', status: 'Draft', project: S.config.project || '', area: '', researcher: S.me.name || '', reviewer: '',
+      id: uid(), code: '', status: 'Draft', project: S.config.project || '', area: '', researcher: S.me.name || '', createdById: S.me.id || '', reviewer: '',
       date: today(), family: '', age: '', members: '', grade: '', nationalId: '', job: '', income: '', mobile: '', notes: '',
       rooms: [], layout: { rooms: {} }, papers: [], createdAt: nowIso(), updatedAt: nowIso(), base: '', dirty: false,
       deviceId: S.me.deviceId, isNew: true
@@ -782,30 +958,42 @@
   }
 
   /* ── Survey editor ───────────────────────── */
+  /** Team leaders don't get the Papers step (ID photos stay with the researchers and managers). */
+  const stepsFor = () => (isLeader() ? [0, 1, 2, 4] : [0, 1, 2, 3, 4]);
+
   function renderEditor(id) {
     currentView = 'editor';
     const s = S.surveys.get(id);
     if (!S.cur || S.cur.id !== id) S.cur = { id, step: S.stepOf[id] || 0, sel: null };
     ensureLayout(s);
+    const order = stepsFor();
+    if (order.indexOf(S.cur.step) < 0) S.cur.step = 0;
     const step = S.cur.step;
-    const steps = STEPS.map((st, i) =>
-      '<button class="step' + (i < step ? ' done' : '') + '" data-step="' + i + '"' + (i === step ? ' aria-current="step"' : '') + ' aria-label="Step ' + (i + 1) + ': ' + esc(st.label) + '"><span class="n">' + (i + 1) + '</span><span class="lbl">' + esc(st.label) + '</span></button>').join('');
+    const pos = order.indexOf(step);
+    const ro = !canEdit(s);
+    const steps = order.map((i, n) =>
+      '<button class="step' + (n < pos ? ' done' : '') + '" data-step="' + i + '"' + (i === step ? ' aria-current="step"' : '') + ' aria-label="Step ' + (n + 1) + ': ' + esc(STEPS[i].label) + '"><span class="n">' + (n + 1) + '</span><span class="lbl">' + esc(STEPS[i].label) + '</span></button>').join('');
     let body = '';
-    if (step === 0) body = familyStep(s);
-    else if (step === 1) body = roomsStep(s);
-    else if (step === 2) body = planStep(s);
+    if (step === 0) body = familyStep(s, ro);
+    else if (step === 1) body = roomsStep(s, ro);
+    else if (step === 2) body = planStep(s, ro);
     else if (step === 3) body = papersStep(s);
     else body = woodStep(s);
-    const next = STEPS[step + 1];
+    const next = order[pos + 1] != null ? order[pos + 1] : null;
+    const prev = pos > 0 ? order[pos - 1] : null;
+    const backLabel = S.backTo && S.backTo.indexOf('day-') === 0 ? 'Day' : 'Surveys';
     app().innerHTML = appbar({ back: true, eyebrow: s.code || 'Not uploaded yet', title: s.family || 'New survey' }) +
       '<main class="page"><div class="page-inner">' +
-      '<nav class="steps" aria-label="Survey steps">' + steps + '</nav>' + body +
+      '<nav class="steps" aria-label="Survey steps">' + steps + '</nav>' +
+      (ro ? '<div class="notice info small ro-note"><div>' + esc(whyReadOnly(s)) + '</div></div>' : '') +
+      body +
       '</div></main>' +
       '<div class="bottombar"><div class="bottombar-inner">' +
-      (step > 0 ? '<button class="btn ghost" data-step="' + (step - 1) + '">Back</button>' : '<button class="btn ghost" data-act="back">Surveys</button>') +
+      (prev != null ? '<button class="btn ghost" data-step="' + prev + '">Back</button>' : '<button class="btn ghost" data-act="back">' + backLabel + '</button>') +
       '<span class="grow"></span>' +
-      (next ? '<button class="btn" data-step="' + (step + 1) + '">Next: ' + esc(next.label) + '</button>' : '<button class="btn leaf" data-act="back">Done</button>') +
+      (next != null ? '<button class="btn" data-step="' + next + '">Next: ' + esc(STEPS[next].label) + '</button>' : '<button class="btn leaf" data-act="back">Done</button>') +
       '</div></div>';
+    if (step === 0) updateDupWarn(s);
     if (step === 2) setupPlan();
     if (step === 3) renderPapersList();
     window.scrollTo(0, 0);
@@ -823,26 +1011,167 @@
     return '<label class="field' + (opt.wide ? ' wide' : '') + '"><span>' + esc(label) + '</span>' + inner + (opt.help ? '<small>' + esc(opt.help) + '</small>' : '') + '</label>';
   }
 
-  function familyStep(s) {
-    return '<section class="panel"><div class="panel-head"><h2>Family</h2></div><div class="fields">' +
+  function familyStep(s, ro) {
+    const leader = isLeader();
+    return statusPanel(s, false) +
+      '<fieldset class="ro-set"' + (ro ? ' disabled' : '') + '><section class="panel"><div class="panel-head"><h2>Family</h2></div><div class="fields">' +
       field('family', 'Head of family', s, { dir: true, wide: true, attrs: ' autocomplete="off"' }) +
       field('area', 'Area / village', s, { dir: true }) +
       field('mobile', 'Mobile', s, { type: 'tel', attrs: ' inputmode="tel" autocomplete="off"' }) +
       field('age', 'Age', s, { attrs: ' inputmode="numeric"' }) +
       field('members', 'Family members', s, { attrs: ' inputmode="numeric"' }) +
       field('grade', 'Case grade', s, { options: [''].concat(GRADES) }) +
-      field('nationalId', 'National ID no.', s, { attrs: ' inputmode="numeric" autocomplete="off"' }) +
-      field('job', 'Job', s, { dir: true }) +
-      field('income', 'Monthly income', s, { dir: true }) +
-      '</div></section>' +
-      '<section class="panel"><div class="panel-head"><h2>Visit</h2></div><div class="fields">' +
-      field('project', 'Project / team', s, { dir: true, help: 'Printed at the top of the PDF, e.g. Roofing Wadi El Natron Team' }) +
-      field('researcher', 'Researcher', s, { dir: true }) +
-      field('reviewer', 'Reviewer', s, { dir: true }) +
+      (leader ? '' : field('nationalId', 'National ID no.', s, { attrs: ' inputmode="numeric" autocomplete="off"' }) +
+        field('job', 'Job', s, { dir: true }) +
+        field('income', 'Monthly income', s, { dir: true })) +
+      '</div><div id="dupWarn"></div></section></fieldset>' +
+      locationHtml(s, ro) +
+      '<fieldset class="ro-set"' + (ro ? ' disabled' : '') + '><section class="panel"><div class="panel-head"><h2>Visit</h2></div><div class="fields">' +
+      field('project', 'Project / team', s, { dir: true, help: 'Printed at the top of the PDF' }) +
       field('date', 'Survey date', s, { type: 'date' }) +
-      field('status', 'Status', s, { options: STATUSES }) +
       field('notes', 'Notes', s, { textarea: true, wide: true, dir: true }) +
-      '</div></section>';
+      '</div></section></fieldset>';
+  }
+
+  /** Who did what: filled in by the sheet from each person's code, never typed. */
+  function peopleLine(s) {
+    const t = taskOf(s);
+    const day = t ? t.name + (t.date ? ' (' + t.date + ')' : '') : s.day || '';
+    return [
+      'Surveyed by <bdi>' + esc(s.researcher || (s.base ? '—' : S.me.name)) + '</bdi>',
+      s.reviewer ? 'reviewed by <bdi>' + esc(s.reviewer) + '</bdi>' : 'not reviewed yet',
+      s.approvedBy ? 'approved by <bdi>' + esc(s.approvedBy) + '</bdi>' : '',
+      day ? 'implementation day <bdi>' + esc(day) + '</bdi>' : ''
+    ].filter(Boolean).join(' · ');
+  }
+
+  /** The buttons each role gets for moving a survey along: researcher → reviewer → manager → team leader. */
+  function statusActions(s) {
+    const st = s.status || 'Draft';
+    const b = (to, label, cls) => '<button class="btn ' + (cls || 'ghost') + ' sm" data-setstatus="' + to + '">' + esc(label) + '</button>';
+    const out = [];
+    if (CFG.demo || isMgr()) {
+      if (st === 'Draft' || st === 'Submitted' || st === 'Reviewed') out.push(b('Approved', 'Approve', 'leaf'));
+      if (st === 'Approved') out.push(b('Roofed', 'Mark roofed', 'leaf'), b('Reviewed', 'Undo approval'));
+      if (st === 'Roofed') out.push(b('Approved', 'Not roofed yet'));
+      if (st === 'Cancelled') out.push(b('Draft', 'Restore'));
+      out.push('<label class="status-pick"><span class="small muted">Status</span><select data-statuspick aria-label="Set status">' +
+        STATUSES.map((x) => '<option' + (x === st ? ' selected' : '') + '>' + x + '</option>').join('') + '</select></label>');
+    } else if (role() === 'Reviewer') {
+      if (st === 'Draft' || st === 'Submitted') out.push(b('Reviewed', 'Mark reviewed', 'leaf'));
+      if (st === 'Submitted') out.push(b('Draft', 'Send back to researcher'));
+      if (st === 'Reviewed') out.push(b('Submitted', 'Undo review'));
+    } else if (role() === 'Researcher') {
+      if (isOwner(s) && st === 'Draft') out.push(b('Submitted', 'Submit for review', 'leaf'));
+      if (isOwner(s) && st === 'Submitted') out.push(b('Draft', 'Back to draft'));
+    } else if (isLeader() && taskOf(s)) {
+      if (st === 'Roofed') out.push(b('Pending', 'Mark pending'));
+      else out.push(b('Roofed', 'Mark roofed', 'leaf'));
+    }
+    return out.join('');
+  }
+
+  function statusPanel(s, full) {
+    const acts = statusActions(s);
+    const missingPapers = full && !isLeader() ? paperTypes(s).filter((t) => t.required && !(s.papers || []).some((p) => p.paper === t.name)) : [];
+    const waitingMark = S.pendingStates.some((x) => x.surveyId === s.id);
+    return '<section class="panel status-panel"><div class="panel-head"><h2>Status</h2><span class="status st-' + esc(s.status || 'Draft') + '">' + esc(s.status || 'Draft') + '</span></div>' +
+      '<div class="small muted">' + peopleLine(s) + (waitingMark ? ' · <b>mark waiting to upload</b>' : '') + '</div>' +
+      (missingPapers.length ? '<div class="notice warn small"><div>Missing required papers: <span dir="auto">' + missingPapers.map((t) => esc(t.name)).join(', ') + '</span></div></div>' : '') +
+      (acts ? '<div class="btn-row status-row">' + acts + '</div>' : '') +
+      '</section>';
+  }
+
+  /* ── House location (GPS) ───────────────────────── */
+  const fix6 = (v) => Number(v).toFixed(6);
+  const mapsLink = (L) => 'https://www.google.com/maps/search/?api=1&query=' + fix6(L.lat) + ',' + fix6(L.lng);
+  const navLink = (L) => 'https://www.google.com/maps/dir/?api=1&destination=' + fix6(L.lat) + ',' + fix6(L.lng);
+  const hasLoc = (s) => !!(s && s.location && isFinite(s.location.lat) && isFinite(s.location.lng));
+
+  function locationHtml(s, ro) {
+    const L = hasLoc(s) ? s.location : null;
+    let inner;
+    if (L) {
+      inner = '<div class="loc"><div class="loc-coords"><b class="data">' + fix6(L.lat) + ', ' + fix6(L.lng) + '</b>' +
+        '<span class="small muted">' + (L.acc ? 'accurate to ± ' + Math.round(L.acc) + ' m · ' : '') + 'saved ' + esc(fmtWhen(L.at)) + '</span></div>' +
+        '<div class="btn-row"><a class="btn sm" href="' + navLink(L) + '" target="_blank" rel="noopener">' + ICON.pin + 'Navigate</a>' +
+        '<a class="btn ghost sm" href="' + mapsLink(L) + '" target="_blank" rel="noopener">Open in Maps</a>' +
+        (ro ? '' : '<button class="btn quiet sm" data-act="gps">Save again</button><button class="btn quiet sm" data-act="gps-clear">Remove</button>') + '</div></div>';
+    } else if (ro) {
+      inner = '<p class="small muted" style="margin:0">No location saved for this house.</p>';
+    } else {
+      inner = '<p class="small muted" style="margin:0">At the house door, tap the button. The team finds the house with it on implementation day, and it prints as a QR code on the PDF.</p>' +
+        '<div class="btn-row"><button class="btn ghost" data-act="gps">' + ICON.pin + 'Save house location</button></div>';
+    }
+    return '<section class="panel" id="locPanel"><div class="panel-head"><h2>House location</h2></div>' + inner + '<div id="gpsMsg"></div></section>';
+  }
+
+  let gpsWatch = null;
+  function captureLocation(s) {
+    const msg = (cls, html) => { const m = $('#gpsMsg'); if (m) m.innerHTML = html ? '<div class="notice ' + cls + ' small"><div>' + html + '</div></div>' : ''; };
+    if (!('geolocation' in navigator)) { msg('err', 'This phone or browser cannot share its location.'); return; }
+    if (gpsWatch != null) return;
+    msg('info', 'Finding the location… Stay outside, near the door. This can take up to 30 seconds.');
+    const btns = $$('[data-act="gps"]'); btns.forEach((b) => { b.disabled = true; });
+    let best = null, finished = false;
+    const finish = (err) => {
+      if (finished) return;
+      finished = true;
+      if (gpsWatch != null) { navigator.geolocation.clearWatch(gpsWatch); gpsWatch = null; }
+      clearTimeout(t1); clearTimeout(t2);
+      btns.forEach((b) => { if (b.isConnected) b.disabled = false; });
+      if (!best) {
+        const why = err && err.code === 1
+          ? 'Location permission is off for this app. Allow it in the phone settings (Location → this browser or app), then tap again.'
+          : err && err.code === 2 ? 'The phone could not find its location. Turn on Location (GPS) and try again outside.'
+            : 'It took too long to find the location. Try again outside, away from high walls.';
+        msg('err', why);
+        return;
+      }
+      const live = S.surveys.get(s.id);
+      if (!live) return;
+      live.location = { lat: Math.round(best.latitude * 1e6) / 1e6, lng: Math.round(best.longitude * 1e6) / 1e6, acc: Math.round(best.accuracy || 0), at: nowIso() };
+      live.locationCleared = false;
+      touch(live);
+      if (currentView === 'editor' && S.cur && S.cur.id === live.id && S.cur.step === 0) {
+        const panel = $('#locPanel');
+        if (panel) panel.outerHTML = locationHtml(live, false);
+        if (live.location.acc > 60) msg('warn', '<b>Saved, but rough (± ' + live.location.acc + ' m).</b> For a better point, tap “Save again” outside with a clear view of the sky.');
+        else msg('info', 'Location saved.');
+      }
+    };
+    const t1 = setTimeout(() => finish({ code: 3 }), 30000); // give up
+    const t2 = setTimeout(() => { if (best) finish(); }, 15000); // good enough after 15 s
+    gpsWatch = navigator.geolocation.watchPosition((pos) => {
+      if (!best || pos.coords.accuracy < best.accuracy) best = pos.coords;
+      if (best.accuracy <= 15) finish();
+      else msg('info', 'Finding the location… now ± ' + Math.round(best.accuracy) + ' m. Waiting for a closer fix.');
+    }, (err) => { if (err.code !== 3 || !best) finish(err); }, { enableHighAccuracy: true, maximumAge: 0, timeout: 30000 });
+  }
+
+  /* ── Same family surveyed twice? ───────────────────────── */
+  const digits = (v) => String(v == null ? '' : v)
+    .replace(/[٠-٩]/g, (c) => '٠١٢٣٤٥٦٧٨٩'.indexOf(c)).replace(/[۰-۹]/g, (c) => '۰۱۲۳۴۵۶۷۸۹'.indexOf(c)).replace(/\D/g, '');
+  function duplicatesOf(s) {
+    const id = digits(s.nationalId), mob = digits(s.mobile).slice(-10);
+    const out = [];
+    if (id.length < 10 && mob.length < 8) return out;
+    S.surveys.forEach((o) => {
+      if (o.id === s.id || o.isNew) return;
+      const why = [];
+      if (id.length >= 10 && digits(o.nationalId) === id) why.push('national ID');
+      if (mob.length >= 8 && digits(o.mobile).slice(-10) === mob) why.push('mobile');
+      if (why.length) out.push({ s: o, why });
+    });
+    return out;
+  }
+  function updateDupWarn(s) {
+    const box = $('#dupWarn');
+    if (!box || isLeader()) return;
+    const d = duplicatesOf(s);
+    box.innerHTML = d.length ? '<div class="notice warn small"><div><b>Already surveyed?</b> ' + d.slice(0, 4).map((x) =>
+      'Same ' + x.why.join(' and ') + ' as <a href="#survey-' + esc(x.s.id) + '"><bdi>' + esc((x.s.code || 'not uploaded') + ' · ' + (x.s.family || 'no name')) + '</bdi></a> (' + esc(x.s.status || 'Draft') + (x.s.researcher ? ', by ' + esc(x.s.researcher) : '') + ').').join(' ') +
+      ' Check it is not the same family before continuing.</div></div>' : '';
   }
 
   /* rooms */
@@ -853,13 +1182,13 @@
   }
   const measured = (r) => r.beamSide > 0 && r.plankSide > 0;
 
-  function roomsStep(s) {
+  function roomsStep(s, ro) {
     return '<section class="panel"><div class="panel-head"><h2>Rooms</h2><span class="small muted">Sizes in metres · 345 is read as 3.45 m</span></div>' +
-      '<div class="notice info small"><div><b>Beam side</b> = the side the beams (عروق) lie along. <b>Plank side</b> = the side the planks (ألواح) lie along. Wood length = side + ' + normRules(S.config.rules).allowance + ' cm, rounded up. You can also change the beam direction on the plan. Rooms that will not get a roof can stay without sizes.</div></div>' +
-      '<div class="rooms" id="rooms">' + (s.rooms.length ? s.rooms.map((r, i) => roomHtml(s, r, i)).join('') : '<p class="muted">No rooms yet. Add the first one below.</p>') + '</div>' +
-      '<div><div class="small muted" style="margin-bottom:6px">Add a room</div><div class="quick">' +
-      ROOM_NAMES.map((n) => '<button class="chip" data-addroom="' + esc(n) + '">' + esc(n) + '</button>').join('') +
-      '<button class="chip" data-addroom="">Other…</button></div></div></section>';
+      (ro ? '' : '<div class="notice info small"><div><b>Beam side</b> = the side the beams (عروق) lie along. <b>Plank side</b> = the side the planks (ألواح) lie along. Wood length = side + ' + normRules(S.config.rules).allowance + ' cm, rounded up. You can also change the beam direction on the plan. Rooms that will not get a roof can stay without sizes.</div></div>') +
+      '<fieldset class="ro-set"' + (ro ? ' disabled' : '') + '><div class="rooms" id="rooms">' + (s.rooms.length ? s.rooms.map((r, i) => roomHtml(s, r, i, ro)).join('') : '<p class="muted">No rooms yet.' + (ro ? '' : ' Add the first one below.') + '</p>') + '</div></fieldset>' +
+      (ro ? '' : '<div><div class="small muted" style="margin-bottom:6px">Add a room</div><div class="quick">' +
+        ROOM_NAMES.map((n) => '<button class="chip" data-addroom="' + esc(n) + '">' + esc(n) + '</button>').join('') +
+        '<button class="chip" data-addroom="">Other…</button></div></div>') + '</section>';
   }
 
   function roomWoodHtml(s, i) {
@@ -875,12 +1204,12 @@
       (w.notes && w.notes.length ? '<div class="room-note">' + w.notes.map((n) => esc(n.charAt(0).toUpperCase() + n.slice(1))).join('<br>') + '</div>' : '');
   }
 
-  function roomHtml(s, r, i) {
+  function roomHtml(s, r, i, ro) {
     const c = ROOM_COLORS[(r.color || 0) % ROOM_COLORS.length];
     return '<div class="room' + (r.roof ? '' : ' off') + '" data-rid="' + esc(r.id) + '">' +
       '<div class="room-head"><span class="swatch" style="--sw:' + c.fill + ';--sw-ink:' + c.ink + '">' + (i + 1) + '</span>' +
       '<input type="text" dir="auto" id="rn-' + esc(r.id) + '" data-rf="name" value="' + esc(r.name) + '" placeholder="Room name" aria-label="Room name">' +
-      '<button class="btn danger sm" data-act="remove-room">Remove</button></div>' +
+      (ro ? '<span></span>' : '<button class="btn danger sm" data-act="remove-room">Remove</button>') + '</div>' +
       '<div class="room-meta"><label class="toggle"><input type="checkbox" data-rf="roof" id="rr-' + esc(r.id) + '"' + (r.roof ? ' checked' : '') + '>Roof this room</label>' +
       '<select data-rf="grade" id="rg-' + esc(r.id) + '" aria-label="Room grade">' + [''].concat(GRADES).map((g) => '<option value="' + g + '"' + (g === (r.grade || '') ? ' selected' : '') + '>' + (g ? 'Grade ' + g : 'Grade –') + '</option>').join('') + '</select></div>' +
       '<div class="dims">' +
@@ -982,15 +1311,15 @@
     return { x: cx - w / 2, y: cy - h / 2, w, h };
   }
 
-  function planStep(s) {
+  function planStep(s, ro) {
     const unplaced = s.rooms.filter((r) => !measured(r));
-    return '<section class="panel"><div class="panel-head"><h2>House plan</h2><span class="small muted">Drag rooms into place · they snap to each other · each square is 1 m</span></div>' +
+    return '<section class="panel"><div class="panel-head"><h2>House plan</h2><span class="small muted">' + (ro ? 'Tap a room to see its sizes · each square is 1 m' : 'Drag rooms into place · they snap to each other · each square is 1 m') + '</span></div>' +
       '<div class="plan-tools"><span class="sel-name" id="selName" dir="auto">Tap a room to select it</span>' +
-      '<button class="btn ghost sm" data-act="rotate" id="rotBtn" disabled>' + ICON.rotate + 'Turn</button>' +
-      '<button class="btn ghost sm" data-act="swap-beams" id="swapBtn" disabled>' + ICON.wood + 'Change beam direction</button>' +
-      '<button class="btn ghost sm" data-act="tidy">Line up rooms</button>' +
+      (ro ? '' : '<button class="btn ghost sm" data-act="rotate" id="rotBtn" disabled>' + ICON.rotate + 'Turn</button>' +
+        '<button class="btn ghost sm" data-act="swap-beams" id="swapBtn" disabled>' + ICON.wood + 'Change beam direction</button>' +
+        '<button class="btn ghost sm" data-act="tidy">Line up rooms</button>') +
       '<button class="btn ghost sm" data-act="export" data-kind="png">' + ICON.download + 'Save drawing</button></div>' +
-      '<div class="plan-wrap"><svg id="plan" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="House plan"></svg></div>' +
+      '<div class="plan-wrap"><svg id="plan"' + (ro ? ' class="ro"' : '') + ' xmlns="http://www.w3.org/2000/svg" role="img" aria-label="House plan"></svg></div>' +
       '<div class="legend"><span><i style="background:#F4A817"></i>Gets a new roof</span><span><i style="background:transparent;border-color:var(--muted)"></i>No new roof</span><span><i class="beam-key"></i>Lines = beams (عروق) and their direction</span></div>' +
       '<div id="planWarn"></div>' +
       (unplaced.length ? '<div class="notice info small"><div><b>Not on the plan (no sizes):</b> <span dir="auto">' + unplaced.map((r) => esc(r.name || 'Unnamed room')).join(', ') + '</span>. Add sizes in Rooms to draw them.</div></div>' : '') +
@@ -1007,7 +1336,7 @@
     svg.addEventListener('pointercancel', onPlanUp);
     svg.addEventListener('keydown', onPlanKey);
     // iPhone: stop the page from scrolling while a room is being dragged
-    svg.addEventListener('touchstart', (e) => { if (e.target.closest && e.target.closest('.room-g')) e.preventDefault(); }, { passive: false });
+    svg.addEventListener('touchstart', (e) => { if (canEdit(curSurvey()) && e.target.closest && e.target.closest('.room-g')) e.preventDefault(); }, { passive: false });
   }
 
   function renderPlan() {
@@ -1135,6 +1464,7 @@
     $$('#plan .room-g').forEach((x) => x.classList.toggle('sel', x === g));
     updateSelTools();
     const pl = s.layout.rooms[rid];
+    if (!canEdit(s)) return; // view only: tap shows the sizes, no dragging
     const p = svgPoint(e);
     drag = { rid, sx: p.x, sy: p.y, ox: pl.x, oy: pl.y, moved: false, g, ppm: pxPerMetre() };
     try { g.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
@@ -1169,6 +1499,7 @@
     const g = e.target.closest && e.target.closest('.room-g');
     if (!g) return;
     const s = curSurvey();
+    if (!canEdit(s)) return;
     const pl = s.layout.rooms[g.dataset.rid];
     const step = e.shiftKey ? 0.5 : 0.05;
     const moves = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] };
@@ -1210,6 +1541,7 @@
     const s = curSurvey();
     const box = $('#papers');
     if (!s || !box) return;
+    const canAdd = canAddPapers(s);
     box.innerHTML = paperTypes(s).map((t, ti) => {
       const files = (s.papers || []).filter((p) => p.paper === t.name);
       const tag = files.length ? '<span class="tag ok">' + files.length + ' added</span>' : (t.required ? '<span class="tag req">Required</span>' : '<span class="tag">Optional</span>');
@@ -1219,12 +1551,12 @@
           const isPdf = /pdf/.test(p.mime || '') || /\.pdf$/i.test(p.name || '');
           const img = p.thumb ? '<img src="' + esc(p.thumb) + '" alt="">' : '<span>' + (isPdf ? 'PDF<br>' : '') + 'Tap to open</span>';
           return '<div class="thumb"><button class="open" data-viewpaper="' + esc(p.id) + '" aria-label="Open ' + esc(t.name) + '">' + img + '</button><span class="st">' + st + '</span>' +
-            (p.status !== 'uploaded' ? '<button class="x" data-delpaper="' + esc(p.id) + '" aria-label="Remove this photo">×</button>' : '') + '</div>';
+            (p.status !== 'uploaded' && canAdd ? '<button class="x" data-delpaper="' + esc(p.id) + '" aria-label="Remove this photo">×</button>' : '') + '</div>';
         }).join('') + '</div>' : '') +
-        '<div class="btn-row">' +
-        '<span class="btn ghost sm filebtn">' + ICON.camera + 'Take photo<input type="file" accept="image/*" capture="environment" data-paper="' + ti + '" aria-label="Take a photo of ' + esc(t.name) + '"></span>' +
-        '<span class="btn quiet sm filebtn">' + ICON.file + 'Choose file<input type="file" accept="image/*,application/pdf" multiple data-paper="' + ti + '" aria-label="Choose a file for ' + esc(t.name) + '"></span>' +
-        '</div></div>';
+        (canAdd ? '<div class="btn-row">' +
+          '<span class="btn ghost sm filebtn">' + ICON.camera + 'Take photo<input type="file" accept="image/*" capture="environment" data-paper="' + ti + '" aria-label="Take a photo of ' + esc(t.name) + '"></span>' +
+          '<span class="btn quiet sm filebtn">' + ICON.file + 'Choose file<input type="file" accept="image/*,application/pdf" multiple data-paper="' + ti + '" aria-label="Choose a file for ' + esc(t.name) + '"></span>' +
+          '</div>' : '') + '</div>';
     }).join('');
   }
 
@@ -1348,7 +1680,6 @@
     const rules = normRules(S.config.rules);
     const totalBox = (title, map) => '<div class="total"><h3>' + title + '</h3>' +
       (Object.keys(map).length ? Object.keys(map).map(Number).sort((a, b) => a - b).map((k) => '<div class="big">' + k + ' cm × ' + map[k] + '</div>').join('') : '<div class="none">Nothing yet</div>') + '</div>';
-    const missingPapers = paperTypes(s).filter((t) => t.required && !(s.papers || []).some((p) => p.paper === t.name));
     return '<section class="panel"><div class="panel-head"><h2>Wood to buy</h2><span class="small muted">Lengths in cm × pieces</span></div>' +
       (rules.example ? '<div class="notice warn small"><div><b>Example wood rules.</b> These numbers use example rounding. Set your team\'s rules in the Google Sheet, tab “Wood rules”.</div></div>' : '') +
       woodTableHtml(s) +
@@ -1360,19 +1691,10 @@
       '<section class="panel"><div class="panel-head"><h2>Export for implementation day</h2></div>' +
       '<p class="muted small" style="margin:0">One page with the plan, room sizes and the wood list, like your printed sheet. Share it to WhatsApp or save it.</p>' +
       '<div class="btn-row"><button class="btn" data-act="export" data-kind="pdf">' + ICON.file + 'PDF</button><button class="btn ghost" data-act="export" data-kind="pptx">' + ICON.file + 'PowerPoint</button><button class="btn ghost" data-act="export" data-kind="png">' + ICON.download + 'Drawing image</button></div></section>' +
-      '<section class="panel"><div class="panel-head"><h2>Review &amp; status</h2><span class="status st-' + esc(s.status) + '">' + esc(s.status) + '</span></div>' +
-      '<div class="small muted">' + [s.researcher ? 'Surveyed by <bdi>' + esc(s.researcher) + '</bdi>' : '', s.reviewer ? 'Reviewer: <bdi>' + esc(s.reviewer) + '</bdi>' : 'No reviewer yet', s.updatedBy ? 'Last saved by <bdi>' + esc(s.updatedBy) + '</bdi>' : ''].filter(Boolean).join(' · ') + '</div>' +
-      (missingPapers.length ? '<div class="notice warn small"><div>Missing required papers: <span dir="auto">' + missingPapers.map((t) => esc(t.name)).join(', ') + '</span></div></div>' : '') +
-      '<div class="btn-row">' +
-      (s.status === 'Draft' ? '<button class="btn leaf" data-setstatus="Submitted">Mark as submitted</button>' : '') +
-      (s.status === 'Submitted' ? '<button class="btn leaf" data-setstatus="Approved">Approve</button><button class="btn ghost" data-setstatus="Draft">Send back to draft</button>' : '') +
-      (s.status === 'Approved' ? '<button class="btn leaf" data-setstatus="Roofed">Mark as roofed</button><button class="btn ghost" data-setstatus="Submitted">Undo approval</button>' : '') +
-      (s.status === 'Roofed' ? '<button class="btn ghost" data-setstatus="Approved">Back to approved</button>' : '') +
-      (s.status === 'Cancelled' ? '<button class="btn ghost" data-setstatus="Draft">Restore survey</button>' : '') +
-      '<button class="btn danger" data-act="delete-survey">Delete survey</button>' +
-      '</div>' +
-      '<p class="small muted" style="margin:0">Delete removes it from the sheet and from every phone. Its photos go to the Google Drive trash, and the sheet keeps a copy in the “Deleted” tab.</p>' +
-      '</section>';
+      statusPanel(s, true) +
+      (canDelete(s) && !s.isNew ? '<section class="panel"><div class="panel-head"><h2>Delete</h2></div>' +
+        '<p class="small muted" style="margin:0">Removes the survey from the sheet and from every phone. Its photos go to the Google Drive trash, and the sheet keeps a copy in the “Deleted” tab.</p>' +
+        '<div class="btn-row"><button class="btn danger" data-act="delete-survey">Delete survey</button></div></section>' : '');
   }
 
   /* ── Wood rules (read from the sheet) ───────────────────────── */
@@ -1415,34 +1737,374 @@
     const p = pendingCount();
     app().innerHTML = appbar({ back: true, eyebrow: 'This phone', title: 'Settings' }) +
       '<main class="page"><div class="page-inner">' +
-      '<form class="panel" id="meForm" novalidate><div class="panel-head"><h2>You</h2></div><div class="fields">' +
-      '<label class="field"><span>Your name</span><input type="text" id="m-name" value="' + esc(S.me.name) + '"></label>' +
-      '<label class="field"><span>Team code</span><input type="text" id="m-key" autocapitalize="off" value="' + esc(S.me.key || '') + '"></label>' +
-      '<label class="field wide"><span>Sheet connection link</span><input type="url" id="m-api" autocapitalize="off" value="' + esc(S.me.api || CFG.apiUrl || '') + '"></label>' +
-      '</div><div class="btn-row"><button class="btn" type="submit">Save</button></div></form>' +
+      '<section class="panel"><div class="panel-head"><h2>You</h2><span class="status st-Submitted">' + esc(role()) + '</span></div>' +
+      '<div class="me-line"><b dir="auto">' + esc(S.me.name || '') + '</b><span class="small muted">' + esc(roleHelp(role())) + '</span></div>' +
+      '<p class="small muted" style="margin:0">Your name and role come from your personal code. Only an admin can change them.</p>' +
+      (CFG.demo ? '' : '<div class="btn-row"><button class="btn ghost" data-act="logout">Log out</button></div>' +
+        '<p class="small muted" style="margin:0">Use this when another person takes over this phone. Surveys stay on the phone.' + (p ? ' <b>' + p + ' item(s) are not uploaded yet: sync first, or they upload under the next person\'s name.</b>' : '') + '</p>') +
+      '</section>' +
+      (CFG.demo ? '' : '<form class="panel" id="meForm" novalidate><div class="panel-head"><h2>Connection</h2></div><div class="fields">' +
+        (CFG.apiUrl
+          ? '<label class="field wide"><span>Sheet connection link</span><input type="url" id="m-api" readonly value="' + esc(apiUrl()) + '"><small>Set for the whole team in config.js on the website.</small></label>'
+          : '<label class="field wide"><span>Sheet connection link</span><input type="url" id="m-api" autocapitalize="off" value="' + esc(S.me.api || '') + '"></label>') +
+        '</div>' + (CFG.apiUrl ? '' : '<div class="btn-row"><button class="btn" type="submit">Save</button></div>') + '</form>') +
       '<section class="panel"><div class="panel-head"><h2>Sync</h2>' + syncPillHtml() + '</div>' +
       '<div class="small">' + S.surveys.size + ' surveys on this phone · ' + p + ' waiting to upload · last sync ' + esc(fmtWhen(S.lastSyncAt ? new Date(S.lastSyncAt).toISOString() : '')) + '</div>' +
       (S.sync.msg ? '<div class="notice ' + (S.sync.state === 'offline' ? 'warn' : 'err') + ' small"><div>' + esc(S.sync.msg) + '</div></div>' : '') +
       '<div class="btn-row"><button class="btn ghost" data-act="sync-now">Sync now</button></div></section>' +
-      '<section class="panel"><div class="panel-head"><h2>Invite researchers</h2></div>' +
-      '<p class="small muted" style="margin:0">Send this link to a researcher. It fills in the connection and team code; they only add their name. Share it only inside the team.</p>' +
-      '<div class="btn-row"><button class="btn ghost" data-act="copy-invite">Copy invite link</button></div><input type="text" id="inviteText" readonly hidden></section>' +
+      (isMgr() && !CFG.demo ? '<section class="panel"><div class="panel-head"><h2>Invite people</h2></div>' +
+        '<p class="small muted" style="margin:0">This link opens the app already connected to the sheet. Each person then types the personal code an admin gave them' + (isAdmin() ? ' (Users → a person → Copy invite also puts their code in the link)' : '') + '.</p>' +
+        '<div class="btn-row"><button class="btn ghost" data-act="copy-invite">Copy invite link</button></div><input type="text" id="inviteText" readonly hidden></section>' : '') +
       (isStandalone() ? '' : '<section class="panel"><div class="panel-head"><h2>Install</h2></div>' + installHelp(false) + '</section>') +
       '<section class="panel"><div class="panel-head"><h2>Reset this phone</h2></div>' +
-      '<p class="small muted" style="margin:0">Removes all surveys and photos from this phone. Surveys already in the sheet are safe.' + (p ? ' <b>' + p + ' items are not uploaded yet and would be lost.</b>' : '') + '</p>' +
+      '<p class="small muted" style="margin:0">Removes all surveys and photos from this phone and logs out. Surveys already in the sheet are safe.' + (p ? ' <b>' + p + ' items are not uploaded yet and would be lost.</b>' : '') + '</p>' +
       '<div class="btn-row"><button class="btn danger" data-act="reset">Reset this phone</button></div>' +
       '<div class="small muted">Shelter Surveys ' + APP_VERSION + '</div></section>' +
       '</div></main>';
-    $('#meForm').addEventListener('submit', async (e) => {
+    const form = $('#meForm');
+    if (form) form.addEventListener('submit', async (e) => {
       e.preventDefault();
-      const name = $('#m-name').value.trim(), key = $('#m-key').value.trim(), api = $('#m-api').value.trim();
-      if (!name || !key || !api) { toast('Name, team code and link are all needed.'); return; }
-      S.me = Object.assign({}, S.me, { name, key, api });
+      const link = cleanApi($('#m-api').value);
+      if (!link) { toast('Paste the sheet connection link.'); return; }
+      S.me = Object.assign({}, S.me, { api: link });
       await DB.setMeta('me', S.me);
       S.sync = { state: 'idle', msg: '' };
       toast('Saved');
       syncNow();
     });
+  }
+
+  function roleHelp(r) {
+    return {
+      Admin: 'Everything, plus adding people and their codes',
+      Manager: 'Approves houses, plans implementation days, purchase lists',
+      'Team leader': 'Sees the houses of their implementation days, marks them roofed',
+      Reviewer: 'Checks and corrects surveys, marks them reviewed',
+      Researcher: 'Records surveys; changes and deletes only their own'
+    }[r] || '';
+  }
+
+  async function logout() {
+    S.me = { deviceId: (S.me && S.me.deviceId) || uid(), api: (S.me && S.me.api) || '' };
+    S.lastPull = ''; S.tasks = []; S.users = []; S.leaders = []; S.needLogin = '';
+    await DB.setMeta('me', S.me);
+    await DB.setMeta('lastPull', '');
+    await DB.setMeta('tasks', []); await DB.setMeta('users', []); await DB.setMeta('leaders', []);
+    S.sync = { state: 'idle', msg: '' };
+    go('');
+  }
+
+  /* ── Implementation days ───────────────────────── */
+  const taskSurveys = (t) => (t.surveyIds || []).map((id) => S.surveys.get(id)).filter(Boolean);
+  const leaderNameOf = (t) => t.leaderName || ((S.leaders.find((l) => l.id === t.leaderId) || {}).name) || (t.leaderId ? 'Team leader' : 'Any team leader');
+  function fmtDay(d) {
+    if (!d) return 'No date';
+    const x = new Date(d + 'T00:00:00');
+    return isNaN(x) ? d : x.toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' });
+  }
+  const dayTitle = (t) => t.name + (t.date ? ' · ' + t.date : '');
+
+  function dayCard(t) {
+    const hs = taskSurveys(t);
+    const n = (t.surveyIds || []).length;
+    const roofed = hs.filter((s) => s.status === 'Roofed').length;
+    const waiting = S.pendingTasks.some((o) => (o.task && o.task.id === t.id)) || hs.some((s) => S.pendingStates.some((x) => x.surveyId === s.id));
+    const pct = n ? Math.round(roofed / n * 100) : 0;
+    const w = isMgr() ? sumWood(hs) : null;
+    const done = n && roofed === n;
+    return '<div class="card day-card" role="button" tabindex="0" data-day="' + esc(t.id) + '">' +
+      '<div class="main"><div class="fam" dir="auto">' + esc(t.name) + '</div>' +
+      '<div class="sub"><bdi>' + esc(fmtDay(t.date)) + '</bdi> · <bdi>' + esc(leaderNameOf(t)) + '</bdi> · ' + n + (n === 1 ? ' house' : ' houses') + '</div>' +
+      '<div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="' + n + '" aria-valuenow="' + roofed + '" aria-label="Roofed houses"><i style="width:' + pct + '%"></i></div>' +
+      '<div class="sub">' + roofed + ' of ' + n + ' roofed</div>' +
+      (w && (Object.keys(w.beams).length || Object.keys(w.planks).length) ? '<div class="wood">Beams ' + esc(woodText(w.beams) || '–') + ' · Planks ' + esc(woodText(w.planks) || '–') + '</div>' : '') +
+      '</div><div class="side"><span class="status ' + (done ? 'st-Roofed' : 'st-Approved') + '">' + (done ? 'Done' : 'Planned') + '</span>' +
+      (waiting ? '<span class="cloud">Not uploaded</span>' : '') + '</div></div>';
+  }
+
+  function renderDays() {
+    currentView = 'days';
+    S.cur = null;
+    S.backTo = '';
+    const td = today();
+    const all = S.tasks.slice();
+    const upcoming = all.filter((t) => !t.date || t.date >= td).sort((a, b) => String(a.date || '9').localeCompare(String(b.date || '9')));
+    const past = all.filter((t) => t.date && t.date < td).sort((a, b) => String(b.date).localeCompare(String(a.date)));
+    const hideInstall = lsGet('shelter-hide-install') === '1';
+    const empty = isMgr()
+      ? '<div class="empty"><h2>No implementation days yet</h2><p>Make a day, choose its team leader and the approved houses. The purchase list adds itself up.</p><button class="btn" data-act="new-day">' + ICON.plus + 'New day</button></div>'
+      : '<div class="empty"><h2>No implementation days for you yet</h2><p>When a manager puts you on a day, its houses and drawings appear here. Open the app with internet to get them.</p></div>';
+    app().innerHTML = appbar({
+      eyebrow: 'Lebaladna · Shelter · ' + (S.me.name || '') + ' (' + role() + ')', title: 'Implementation days', wide: true,
+      actions: (isLeader() ? '<button class="iconbtn" data-act="go-rules" aria-label="Wood rules">' + ICON.wood + '</button>' : '') + '<button class="iconbtn" data-act="go-me" aria-label="Settings">' + ICON.gear + '</button>'
+    }) +
+      '<main class="page wide"><div class="page-inner">' + navTabs('days') +
+      (isLeader() && !hideInstall ? installHelp(true) : '') +
+      (all.length ? (upcoming.length ? '<h2 class="list-title">Coming up</h2><div class="list">' + upcoming.map(dayCard).join('') + '</div>' : '') +
+        (past.length ? '<h2 class="list-title">Earlier</h2><div class="list">' + past.map(dayCard).join('') + '</div>' : '') : empty) +
+      '</div></main>' +
+      (isMgr() ? '<button class="btn fab" data-act="new-day">' + ICON.plus + 'New day</button>' : '');
+  }
+
+  function renderDay(id) {
+    S.backTo = 'day-' + (id || 'new');
+    if (isMgr()) renderDayEdit(id); else renderDayView(id);
+  }
+
+  /** Team leaders: the houses of one day, with the drawing, the way there, and Roofed / Pending. */
+  function renderDayView(id) {
+    currentView = 'day';
+    S.cur = null;
+    const t = S.tasks.find((x) => x.id === id);
+    const hs = taskSurveys(t);
+    const n = (t.surveyIds || []).length;
+    const roofed = hs.filter((s) => s.status === 'Roofed').length;
+    const missing = n - hs.length;
+    const rows = hs.map((s) => {
+      const w = calcWood(s.rooms, S.config.rules);
+      const isRoofed = s.status === 'Roofed';
+      const waiting = S.pendingStates.some((x) => x.surveyId === s.id);
+      return '<div class="house' + (isRoofed ? ' roofed' : '') + '"><div class="house-main"><div class="fam" dir="auto">' + esc(s.family || 'No name') + '</div>' +
+        '<div class="sub">' + [s.code, s.area, s.mobile, w.roofed + (w.roofed === 1 ? ' room' : ' rooms') + ' to roof'].filter(Boolean).map((x) => '<bdi>' + esc(x) + '</bdi>').join(' · ') + '</div>' +
+        '<div class="sub"><span class="status ' + (isRoofed ? 'st-Roofed' : 'st-Approved') + '">' + (isRoofed ? 'Roofed' : 'Pending') + '</span>' + (waiting ? ' <span class="cloud">Not uploaded</span>' : '') + '</div></div>' +
+        '<div class="btn-row">' +
+        '<button class="btn ghost sm" data-openhouse="' + esc(s.id) + '">Drawing</button>' +
+        (hasLoc(s) ? '<a class="btn ghost sm" href="' + navLink(s.location) + '" target="_blank" rel="noopener">' + ICON.pin + 'Navigate</a>' : '<span class="small muted nolocation">No location</span>') +
+        (isRoofed ? '<button class="btn quiet sm" data-mark="' + esc(s.id) + '" data-state="Pending">Mark pending</button>'
+          : '<button class="btn leaf sm" data-mark="' + esc(s.id) + '" data-state="Roofed">' + ICON.check + 'Roofed</button>') +
+        '</div></div>';
+    }).join('');
+    app().innerHTML = appbar({ back: true, backAct: 'go-days', eyebrow: 'Implementation day · ' + fmtDay(t.date), title: t.name }) +
+      '<main class="page"><div class="page-inner">' +
+      '<section class="panel"><div class="panel-head"><h2>' + roofed + ' of ' + n + ' roofed</h2><span class="small muted"><bdi>' + esc(leaderNameOf(t)) + '</bdi></span></div>' +
+      '<div class="progress big"><i style="width:' + (n ? Math.round(roofed / n * 100) : 0) + '%"></i></div>' +
+      '<p class="small muted" style="margin:0">Marks work without internet; they upload when you are back online.</p></section>' +
+      (missing > 0 ? '<div class="notice warn small"><div>' + missing + ' house(s) of this day are not on this phone yet. Open the app with internet to download them.</div></div>' : '') +
+      '<div class="houses">' + (rows || '<p class="muted">No houses in this day yet.</p>') + '</div>' +
+      (hs.length ? '<section class="panel"><div class="panel-head"><h2>Print / share</h2></div><p class="small muted" style="margin:0">One page per house with the drawing, room sizes and wood for each room.</p>' +
+        '<div class="btn-row"><button class="btn" data-act="export-day" data-kind="pdf">' + ICON.file + 'PDF</button><button class="btn ghost" data-act="export-day" data-kind="pptx">' + ICON.file + 'PowerPoint</button></div></section>' : '') +
+      '</div></main>';
+  }
+
+  /** Managers: name, date, team leader, and which approved houses go into the day. */
+  function renderDayEdit(id) {
+    currentView = 'day';
+    S.cur = null;
+    const t = id ? S.tasks.find((x) => x.id === id) : null;
+    const key = id || 'new';
+    if (!S.dayDraft || S.dayDraft.key !== key) {
+      S.dayDraft = { key, id: t ? t.id : uid(), isNew: !t, name: t ? t.name : '', date: t ? t.date : today(), leaderId: t ? t.leaderId || '' : '', picked: new Set(t ? t.surveyIds : []), q: '' };
+    }
+    const d = S.dayDraft;
+    const leaders = S.leaders.slice();
+    if (d.leaderId && !leaders.some((l) => l.id === d.leaderId)) leaders.push({ id: d.leaderId, name: t ? leaderNameOf(t) : 'Team leader' });
+    app().innerHTML = appbar({ back: true, backAct: 'go-days', eyebrow: 'Implementation day', title: d.name || (d.isNew ? 'New day' : 'Day') }) +
+      '<main class="page wide"><div class="page-inner day-edit">' +
+      '<section class="panel"><div class="panel-head"><h2>Day</h2></div><div class="fields">' +
+      '<label class="field"><span>Name</span><input type="text" id="d-name" dir="auto" value="' + esc(d.name) + '" placeholder="e.g. Day 1 – Abu Sultan"></label>' +
+      '<label class="field"><span>Date</span><input type="date" id="d-date" value="' + esc(d.date) + '"></label>' +
+      '<label class="field"><span>Team leader</span><select id="d-leader"><option value="">Any team leader</option>' +
+      leaders.map((l) => '<option value="' + esc(l.id) + '"' + (l.id === d.leaderId ? ' selected' : '') + '>' + esc(l.name) + '</option>').join('') + '</select>' +
+      (leaders.length ? '' : '<small>No team leaders yet. An admin adds them in Users.</small>') + '</label>' +
+      '</div></section>' +
+      '<section class="panel" id="dayTotals"></section>' +
+      '<section class="panel"><div class="panel-head"><h2>Houses</h2><span class="small muted">Approved houses can go into a day</span></div>' +
+      '<div class="search-row"><input type="search" id="d-q" dir="auto" placeholder="Search name, area or code" value="' + esc(d.q) + '" aria-label="Search houses"></div>' +
+      '<div class="pick-list" id="dayHouses"></div></section>' +
+      (d.isNew ? '' : '<section class="panel"><div class="panel-head"><h2>Delete this day</h2></div><p class="small muted" style="margin:0">The houses stay approved and can go into another day.</p><div class="btn-row"><button class="btn danger" data-act="delete-day">Delete day</button></div></section>') +
+      '</div></main>' +
+      '<div class="bottombar wide"><div class="bottombar-inner"><button class="btn ghost" data-act="go-days">Cancel</button><span class="grow"></span><button class="btn leaf" data-act="save-day">' + ICON.check + 'Save day</button></div></div>';
+    $('#d-name').addEventListener('input', (e) => { d.name = e.target.value; const h = $('#title'); if (h) h.textContent = d.name || 'New day'; });
+    $('#d-date').addEventListener('input', (e) => { d.date = e.target.value; });
+    $('#d-leader').addEventListener('change', (e) => { d.leaderId = e.target.value; });
+    $('#d-q').addEventListener('input', (e) => { d.q = e.target.value; renderDayHouses(); });
+    renderDayHouses();
+    renderDayTotals();
+  }
+
+  function renderDayHouses() {
+    const d = S.dayDraft, box = $('#dayHouses');
+    if (!d || !box) return;
+    const words = normText(d.q).split(/\s+/).filter(Boolean);
+    const list = Array.from(S.surveys.values())
+      .filter((s) => !s.isNew && (d.picked.has(s.id) || s.status === 'Approved' || s.status === 'Roofed'))
+      .filter((s) => matchesSearch(s, words))
+      .sort((a, b) => (d.picked.has(b.id) - d.picked.has(a.id)) || String(a.code || 'z').localeCompare(String(b.code || 'z')));
+    box.innerHTML = list.length ? list.map((s) => {
+      const other = S.tasks.find((t) => t.id !== d.id && (t.surveyIds || []).indexOf(s.id) >= 0);
+      const w = calcWood(s.rooms, S.config.rules);
+      const notReady = s.status !== 'Approved' && s.status !== 'Roofed';
+      return '<label class="pick-row' + (d.picked.has(s.id) ? ' on' : '') + '"><input type="checkbox" data-dpick="' + esc(s.id) + '"' + (d.picked.has(s.id) ? ' checked' : '') + (notReady && !d.picked.has(s.id) ? ' disabled' : '') + '>' +
+        '<span class="pick-main"><b dir="auto">' + esc(s.family || 'No name') + '</b><span class="sub">' + [s.code, s.area, w.roofed + ' to roof'].filter(Boolean).map((x) => '<bdi>' + esc(x) + '</bdi>').join(' · ') + '</span>' +
+        (other ? '<span class="sub warnline">Now in <bdi>' + esc(other.name) + '</bdi>' + (d.picked.has(s.id) ? '' : ': ticking moves it here') + '</span>' : '') +
+        (notReady ? '<span class="sub warnline">' + esc(s.status) + ': not approved any more, it will be left out</span>' : '') +
+        (hasLoc(s) ? '' : '<span class="sub muted">No location saved</span>') +
+        '</span><span class="status st-' + esc(s.status) + '">' + esc(s.status) + '</span></label>';
+    }).join('') : '<p class="muted">' + (words.length ? 'No matches.' : 'No approved houses yet. A manager approves surveys first (open a survey → Approve).') + '</p>';
+  }
+
+  function renderDayTotals() {
+    const d = S.dayDraft, box = $('#dayTotals');
+    if (!d || !box) return;
+    const list = Array.from(d.picked).map((id) => S.surveys.get(id)).filter(Boolean);
+    const t = sumWood(list);
+    const block = (title, map) => '<div class="total"><h3>' + title + '</h3>' + (Object.keys(map).length
+      ? Object.keys(map).map(Number).sort((a, b) => a - b).map((k) => '<div class="big">' + k + ' cm × ' + map[k] + '</div>').join('') : '<div class="none">–</div>') + '</div>';
+    box.innerHTML = '<div class="panel-head"><h2>Purchase list</h2><span class="small muted">' + list.length + (list.length === 1 ? ' house' : ' houses') + ' · ' + fmtM(t.area) + ' m² of roof</span></div>' +
+      '<div class="totals">' + block('Beams (عروق)', t.beams) + block('Planks (ألواح)', t.planks) + '</div>' +
+      '<div class="btn-row"><button class="btn ghost sm" data-act="export-day" data-kind="pdf"' + (list.length ? '' : ' disabled') + '>' + ICON.file + 'PDF</button>' +
+      '<button class="btn ghost sm" data-act="export-day" data-kind="pptx"' + (list.length ? '' : ' disabled') + '>' + ICON.file + 'PowerPoint</button></div>';
+  }
+
+  async function saveDay() {
+    const d = S.dayDraft;
+    if (!d) return;
+    const name = (d.name || '').trim() || ('Day ' + (d.date || today()));
+    const task = { id: d.id, name, date: d.date || '', leaderId: d.leaderId || '', surveyIds: Array.from(d.picked) };
+    const leader = S.leaders.find((l) => l.id === task.leaderId);
+    const local = Object.assign({}, task, { leaderName: leader ? leader.name : '' });
+    S.tasks.forEach((o) => { if (o.id !== task.id) o.surveyIds = (o.surveyIds || []).filter((x) => !d.picked.has(x)); }); // one day per house
+    const i = S.tasks.findIndex((x) => x.id === task.id);
+    if (i >= 0) S.tasks[i] = local; else S.tasks.push(local);
+    if (!CFG.demo) {
+      S.pendingTasks = S.pendingTasks.filter((o) => !(o.op === 'save' && o.task.id === task.id));
+      S.pendingTasks.push({ op: 'save', task });
+      await DB.setMeta('pendingTasks', S.pendingTasks);
+    }
+    await DB.setMeta('tasks', S.tasks);
+    S.dayDraft = null;
+    toast('Saved ' + name);
+    go('days');
+    scheduleSync(300);
+  }
+
+  async function deleteDay() {
+    const d = S.dayDraft;
+    if (!d || d.isNew) return;
+    S.tasks = S.tasks.filter((t) => t.id !== d.id);
+    if (!CFG.demo) {
+      S.pendingTasks = S.pendingTasks.filter((o) => !(o.op === 'save' && o.task.id === d.id));
+      S.pendingTasks.push({ op: 'delete', id: d.id });
+      await DB.setMeta('pendingTasks', S.pendingTasks);
+    }
+    await DB.setMeta('tasks', S.tasks);
+    S.dayDraft = null;
+    toast('Day deleted');
+    go('days');
+    scheduleSync(300);
+  }
+
+  /** A team leader's Roofed / Pending mark: saved on the phone at once, uploaded when there is internet. */
+  async function markHouse(s, state) {
+    S.pendingStates = S.pendingStates.filter((x) => x.surveyId !== s.id);
+    if (!CFG.demo) S.pendingStates.push({ surveyId: s.id, state });
+    await DB.setMeta('pendingStates', S.pendingStates);
+    s.status = state === 'Roofed' ? 'Roofed' : 'Approved';
+    await DB.put('surveys', s);
+    toast((s.family || 'House') + ': ' + (state === 'Roofed' ? 'roofed' : 'pending'));
+    updateSyncPill();
+    scheduleSync(300);
+    route();
+  }
+
+  function setStatus(s, to) {
+    if (isLeader()) { markHouse(s, to === 'Roofed' ? 'Roofed' : 'Pending'); return; }
+    if (to === s.status) return;
+    s.status = to;
+    if (to === 'Reviewed') s.reviewer = S.me.name;
+    if (to === 'Approved' && isMgr()) s.approvedBy = S.me.name;
+    touch(s);
+    renderEditor(s.id);
+    toast('Status: ' + to);
+  }
+
+  /* ── Users (admins) ───────────────────────── */
+  function randomCode() {
+    const abc = 'abcdefghjkmnpqrstuvwxyz23456789';
+    let out = '';
+    try { crypto.getRandomValues(new Uint8Array(4)).forEach((b) => { out += abc[b % abc.length]; }); }
+    catch (e) { for (let i = 0; i < 4; i++) out += abc[Math.floor(Math.random() * abc.length)]; }
+    return out + '-' + (1000 + Math.floor(Math.random() * 9000));
+  }
+
+  function renderUsers() {
+    currentView = 'users';
+    S.cur = null;
+    S.backTo = '';
+    const users = S.users.slice();
+    const groups = ROLES.map((r) => [r, users.filter((u) => u.role === r).sort((a, b) => a.name.localeCompare(b.name))]).filter((g) => g[1].length);
+    app().innerHTML = appbar({ eyebrow: 'Lebaladna · Shelter · ' + (S.me.name || '') + ' (Admin)', title: 'Users', wide: true,
+      actions: '<button class="iconbtn" data-act="go-me" aria-label="Settings">' + ICON.gear + '</button>' }) +
+      '<main class="page wide"><div class="page-inner">' + navTabs('users') +
+      '<div class="notice info small"><div>Everyone logs in with their own code. The code decides their name and what they can do. Change a code if it leaks; that person then has to log in again. You can also edit the <b>Users</b> tab in the sheet.</div></div>' +
+      (navigator.onLine === false ? '<div class="notice warn small"><div>Offline. Adding or changing people needs internet.</div></div>' : '') +
+      (groups.length ? groups.map((g) => '<h2 class="list-title">' + esc(g[0]) + 's <span class="muted small">' + g[1].length + '</span></h2><div class="list">' +
+        g[1].map((u) => '<div class="card user-card' + (u.active ? '' : ' off') + '" role="button" tabindex="0" data-edituser="' + esc(u.id) + '">' +
+          '<div class="main"><div class="fam" dir="auto">' + esc(u.name) + (u.id === S.me.id ? ' <span class="muted small">(you)</span>' : '') + '</div>' +
+          '<div class="sub"><span class="data">' + esc(u.code) + '</span>' + (u.phone ? ' · <bdi>' + esc(u.phone) + '</bdi>' : '') + '</div></div>' +
+          '<div class="side">' + (u.active ? '' : '<span class="status st-Cancelled">Off</span>') + '</div></div>').join('') + '</div>').join('')
+        : '<div class="empty"><h2>No users loaded</h2><p>Open the app with internet to load the team.</p></div>') +
+      '</div></main>' +
+      '<button class="btn fab" data-act="add-user">' + ICON.plus + 'Add person</button>';
+  }
+
+  function userSheet(u) {
+    const isNew = !u;
+    u = u || { id: '', name: '', role: 'Researcher', code: randomCode(), phone: '', active: true };
+    showSheet('<h2>' + (isNew ? 'Add person' : 'Edit ' + esc(u.name)) + '</h2>' +
+      '<form id="userForm" class="fields" novalidate data-uid="' + esc(u.id) + '">' +
+      '<label class="field"><span>Name</span><input type="text" id="u-name" dir="auto" value="' + esc(u.name) + '" autocomplete="off"></label>' +
+      '<label class="field"><span>Role</span><select id="u-role">' + ROLES.map((r) => '<option' + (r === u.role ? ' selected' : '') + '>' + r + '</option>').join('') + '</select><small id="u-rolehelp">' + esc(roleHelp(u.role)) + '</small></label>' +
+      '<label class="field"><span>Personal code</span><span class="code-row"><input type="text" id="u-code" class="data" autocapitalize="off" autocomplete="off" value="' + esc(u.code) + '"><button type="button" class="btn ghost sm" data-act="gen-code">New code</button></span><small>At least 4 letters or numbers. Must be different for everyone.</small></label>' +
+      '<label class="field"><span>Phone (optional)</span><input type="tel" id="u-phone" inputmode="tel" value="' + esc(u.phone || '') + '"></label>' +
+      '<label class="toggle field wide"><input type="checkbox" id="u-active"' + (u.active ? ' checked' : '') + '>Active (can log in)</label>' +
+      '<div id="u-msg" class="field wide"></div>' +
+      '<div class="btn-row field wide"><button class="btn" type="submit">' + (isNew ? 'Add' : 'Save') + '</button>' +
+      (isNew ? '' : '<button type="button" class="btn ghost" data-act="copy-user-invite">Copy invite with code</button>') +
+      '<button type="button" class="btn quiet" data-act="close-sheet">Close</button></div>' +
+      '</form>');
+    $('#u-role').addEventListener('change', (e) => { $('#u-rolehelp').textContent = roleHelp(e.target.value); });
+    $('#userForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const body = { id: u.id, name: $('#u-name').value.trim(), role: $('#u-role').value, code: $('#u-code').value.trim(), phone: $('#u-phone').value.trim(), active: $('#u-active').checked };
+      const msg = $('#u-msg');
+      if (!body.name) { msg.innerHTML = '<div class="notice err small"><div>Add a name.</div></div>'; return; }
+      if (body.code.replace(/[\s\-_.]+/g, '').length < 4) { msg.innerHTML = '<div class="notice err small"><div>The code needs at least 4 letters or numbers.</div></div>'; return; }
+      if (CFG.demo) {
+        if (!body.id) body.id = 'demo-' + uid();
+        const i = S.users.findIndex((x) => x.id === body.id);
+        if (i >= 0) S.users[i] = body; else S.users.push(body);
+        if (body.role === 'Team leader' && !S.leaders.some((l) => l.id === body.id)) S.leaders.push({ id: body.id, name: body.name });
+        closeSheet(); renderUsers(); toast('Saved (preview only)');
+        return;
+      }
+      msg.innerHTML = '<div class="notice info small"><div>Saving…</div></div>';
+      try {
+        const res = await api('saveUser', { user: body }, 30000);
+        S.users = res.users || S.users;
+        S.leaders = S.users.filter((x) => x.active && x.role === 'Team leader').map((x) => ({ id: x.id, name: x.name }));
+        await DB.setMeta('users', S.users); await DB.setMeta('leaders', S.leaders);
+        if (body.id && body.id === S.me.id) { // you changed your own code, name or role
+          S.me = Object.assign({}, S.me, { key: body.code, name: body.name, role: body.role });
+          await DB.setMeta('me', S.me);
+        }
+        closeSheet();
+        toast(body.id ? 'Saved ' + body.name : 'Added ' + body.name + ' · code ' + body.code, 4000);
+        route();
+      } catch (err) {
+        msg.innerHTML = '<div class="notice err small"><div>' + esc(err.code === 'offline' ? 'No internet. Adding or changing people needs internet.' : err.message) + '</div></div>';
+      }
+    });
+  }
+
+  function inviteLink(code) {
+    let link = location.origin + location.pathname + '?api=' + encodeURIComponent(apiUrl());
+    if (code) link += '&code=' + encodeURIComponent(code);
+    return link;
+  }
+  async function copyText(text, box) {
+    try { await navigator.clipboard.writeText(text); toast('Copied'); return true; }
+    catch (err) { if (box) { box.hidden = false; box.value = text; box.select(); } toast('Copy it from the box'); return false; }
   }
 
   /* ═════════════════════ Exports (PDF + PowerPoint) ═════════════════════ */
@@ -1673,6 +2335,27 @@
     return Math.max(y, m * 0.7 + lh) + 20;
   }
 
+  /** QR code from qrcode.js (MIT), drawn as squares so it stays sharp in the PDF. */
+  function qrFor(text) {
+    const q = window.qrcode(0, 'M');
+    q.addData(text);
+    q.make();
+    return q;
+  }
+  function drawQr(ctx, text, x, y, size) {
+    const q = qrFor(text), n = q.getModuleCount();
+    const cell = Math.floor(size / (n + 4)), pad = (size - cell * n) / 2;
+    ctx.fillStyle = '#FFFFFF'; ctx.fillRect(x, y, size, size);
+    ctx.fillStyle = '#000000';
+    for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) if (q.isDark(r, c)) ctx.fillRect(Math.round(x + pad + c * cell), Math.round(y + pad + r * cell), cell, cell);
+  }
+  function qrPng(text, px) {
+    const c = document.createElement('canvas');
+    c.width = c.height = px;
+    drawQr(c.getContext('2d'), text, 0, 0, px);
+    return c.toDataURL('image/png');
+  }
+
   function drawSheet(ctx, s, W, H, lg) {
     const m = Math.round(W * 0.055);
     const w = calcWood(s.rooms, S.config.rules);
@@ -1691,7 +2374,9 @@
     const rows = w.rooms.filter((r) => r.roof);
     const rowH = clamp((H * 0.3) / Math.max(rows.length + 1, 6), 46, 66);
     const tableH = (rows.length + 1) * rowH;
-    const totalsH = (2 + Math.max(1, Object.keys(w.beams).length) + Math.max(1, Object.keys(w.planks).length)) * rowH + 52 + 40;
+    const showQr = hasLoc(s) && !!window.qrcode;
+    const qrSize = 230;
+    const totalsH = (2 + Math.max(1, Object.keys(w.beams).length) + Math.max(1, Object.keys(w.planks).length)) * rowH + 52 + 40 + (showQr ? qrSize + 110 : 0);
     const extraLines = w.warnings.length + w.notes.length * 2 + (rules.example ? 1 : 0) + (s.notes ? 2 : 0);
     const footerH = 110;
     const planTop = top + 50;
@@ -1741,6 +2426,15 @@
     totalBox('Total planks', w.planks);
     setFont(ctx, 26, 400); ctx.fillStyle = '#5D6A71'; ctx.textAlign = 'center';
     ctx.fillText('Roof area ' + fmtM(w.roofArea) + ' m²', bx + bw / 2, by + 10);
+    if (showQr) { // scan with any phone camera: opens the way to the house in Maps
+      const qx = bx + (bw - qrSize) / 2, qy = by + 44;
+      drawQr(ctx, navLink(s.location), qx, qy, qrSize);
+      setFont(ctx, 24, 700); ctx.fillStyle = '#1D2428'; ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+      ctx.fillText('Scan to navigate', bx + bw / 2, qy + qrSize + 32);
+      setFont(ctx, 21, 400); ctx.fillStyle = '#5D6A71';
+      ctx.fillText(fix6(s.location.lat) + ', ' + fix6(s.location.lng), bx + bw / 2, qy + qrSize + 62);
+      by = qy + qrSize + 62;
+    }
 
     // notes & warnings
     let ny = Math.max(ty + tableH, by) + 60;
@@ -1780,13 +2474,15 @@
     return y;
   }
 
-  function drawSummary(ctx, list, W, H, lg) {
+  function drawSummary(ctx, list, W, H, lg, opts) {
+    opts = opts || {};
     const m = Math.round(W * 0.055);
     const t = sumWood(list);
     ctx.fillStyle = '#FFFFFF'; ctx.fillRect(0, 0, W, H);
     let y = drawHeader(ctx, W, m, lg, [
       { text: 'Purchase list', size: 64, weight: 700, display: true },
-      { text: list.length + ' houses · ' + fmtM(t.area) + ' m² of roof', size: 38, weight: 400 },
+      { text: opts.title || '', size: 40, weight: 700 },
+      { text: [opts.leader ? 'Team leader: ' + opts.leader : '', list.length + (list.length === 1 ? ' house' : ' houses'), fmtM(t.area) + ' m² of roof'].filter(Boolean).join(' · '), size: 36, weight: 400 },
       { text: 'Printed ' + today(), size: 30, weight: 400, color: '#5D6A71' }
     ]) + 30;
     const colW = (W - 2 * m - 40) / 2;
@@ -1825,8 +2521,11 @@
     if (list.length > rows.length) { setFont(ctx, 26, 400); ctx.fillStyle = '#5D6A71'; ctx.fillText('+ ' + (list.length - rows.length) + ' more houses on the next pages', m, y + 40); }
   }
 
-  async function buildPdf(list) {
+  async function buildPdf(list, opts) {
+    opts = opts || {};
+    const withSummary = opts.summary != null ? opts.summary : list.length > 1;
     await loadScript(ASSET.jspdf);
+    if (list.some(hasLoc)) await loadScript(ASSET.qr).catch(() => null); // no QR is better than no PDF
     await readyFonts();
     const lg = await logos();
     const jsPDF = window.jspdf.jsPDF;
@@ -1841,13 +2540,16 @@
       first = false;
       pdf.addImage(c.toDataURL('image/jpeg', 0.9), 'JPEG', 0, 0, 210, 297, undefined, 'FAST');
     };
-    if (list.length > 1) { drawSummary(ctx, list, W, H, lg); addPage(); }
+    if (withSummary) { drawSummary(ctx, list, W, H, lg, opts); addPage(); }
     for (const s of list) { ensureLayout(s); drawSheet(ctx, s, W, H, lg); addPage(); }
     return pdf.output('blob');
   }
 
-  async function buildPptx(list) {
+  async function buildPptx(list, opts) {
+    opts = opts || {};
+    const withSummary = opts.summary != null ? opts.summary : list.length > 1;
     await loadScript(ASSET.pptx);
+    if (list.some(hasLoc)) await loadScript(ASSET.qr).catch(() => null);
     const lg = await logos();
     const logoData = {};
     if (lg.shelter) logoData.shelter = { data: imgDataUrl(lg.shelter), ratio: lg.shelter.naturalWidth / lg.shelter.naturalHeight };
@@ -1856,8 +2558,8 @@
     pres.defineLayout({ name: 'SHELTER', width: 7.5, height: 13.333 });
     pres.layout = 'SHELTER';
     pres.author = 'Lebaladna Shelter';
-    pres.title = list.length > 1 ? 'Shelter purchase list' : 'Shelter survey ' + (list[0].code || '');
-    if (list.length > 1) summarySlide(pres, list, logoData);
+    pres.title = opts.title ? 'Shelter – ' + opts.title : list.length > 1 ? 'Shelter purchase list' : 'Shelter survey ' + (list[0].code || '');
+    if (withSummary) summarySlide(pres, list, logoData, opts);
     list.forEach((s) => { ensureLayout(s); surveySlide(pres, s, logoData); });
     let blob = await pres.write({ outputType: 'blob' });
     if (!(blob instanceof Blob)) blob = new Blob([blob], { type: 'application/vnd.openxmlformats-officedocument.presentationml.presentation' });
@@ -1897,7 +2599,9 @@
     const rows = w.rooms.filter((r) => r.roof);
     const rowH = 0.34;
     const tableH = (rows.length + 1) * rowH;
-    const box = { x: 0.5, y: y + 0.45, w: 6.5, h: Math.max(3.5, 13.333 - 0.55 - 0.5 - tableH - 0.55 - (y + 0.45)) };
+    const showQr = hasLoc(s) && !!window.qrcode;
+    const colH = (2 + Math.max(1, Object.keys(w.beams).length) + Math.max(1, Object.keys(w.planks).length)) * rowH + 0.5 + (showQr ? 1.95 : 0);
+    const box = { x: 0.5, y: y + 0.45, w: 6.5, h: Math.max(3.5, 13.333 - 0.55 - 0.5 - Math.max(tableH, colH) - 0.55 - (y + 0.45)) };
     box.h = Math.min(box.h, 6.3);
     const items = planItems(s);
     if (items.length) {
@@ -1987,6 +2691,13 @@
     };
     totalTable('Total beams', w.beams);
     totalTable('Total planks', w.planks);
+    if (showQr) {
+      const url = navLink(s.location);
+      // PptxGenJS writes an image's link into the file without escaping "&" (text links are escaped), so escape it here
+      slide.addImage({ data: qrPng(url, 600), x: 5.55, y: by, w: 1.3, h: 1.3, hyperlink: { url: url.replace(/&/g, '&amp;'), tooltip: 'Navigate to the house' }, altText: 'QR code: way to the house in Google Maps' });
+      slide.addText([{ text: 'Scan to navigate', options: { bold: true, color: '1D2428', hyperlink: { url } } }, { text: '\n' + fix6(s.location.lat) + ', ' + fix6(s.location.lng), options: { color: '5D6A71', fontSize: 7 } }],
+        { x: 5.3, y: by + 1.32, w: 1.8, h: 0.42, fontFace: 'Arial', fontSize: 9, align: 'center', margin: 0, isTextBox: true });
+    }
 
     const foot = [];
     if (rules.example) foot.push({ text: 'Wood uses EXAMPLE rules – confirm before buying.  ', options: { color: 'B42318', bold: true } });
@@ -1997,14 +2708,16 @@
     if (s.notes) slide.addNotes(s.notes);
   }
 
-  function summarySlide(pres, list, logoData) {
+  function summarySlide(pres, list, logoData, opts) {
+    opts = opts || {};
     const slide = pres.addSlide();
     slide.background = { color: 'FFFFFF' };
     const t = sumWood(list);
     const y = slideHeader(pres, slide, logoData, [
-      { text: 'Purchase list', size: 26, bold: true, h: 0.6 },
-      { text: list.length + ' houses · ' + fmtM(t.area) + ' m² of roof', size: 13, h: 0.34 },
-      { text: 'Printed ' + today(), size: 11, color: '5D6A71', h: 0.3 }
+      { text: 'Purchase list', size: 26, bold: true, h: 0.56 },
+      { text: opts.title || '', size: 14, bold: true, h: 0.32 },
+      { text: [opts.leader ? 'Team leader: ' + opts.leader : '', list.length + (list.length === 1 ? ' house' : ' houses'), fmtM(t.area) + ' m² of roof'].filter(Boolean).join(' · '), size: 12, h: 0.32 },
+      { text: 'Printed ' + today(), size: 11, color: '5D6A71', h: 0.28 }
     ]);
     const border = { type: 'solid', pt: 1, color: 'C9D2D7' };
     const cell = (text, o) => ({ text: String(text), options: Object.assign({ fontFace: 'Arial', fontSize: 11, color: '1D2428', border: [border, border, border, border], valign: 'middle', margin: 0.05 }, o || {}) });
@@ -2025,8 +2738,9 @@
     slide.addTable(rows, { x: 0.5, y: ty, w: 6.5, colW: [0.85, 1.85, 1.3, 1.25, 1.25], rowH: 0.32 });
   }
 
-  function exportName(list, ext) {
+  function exportName(list, ext, opts) {
     const clean = (t) => String(t || '').replace(/[\\/:*?"<>|]+/g, ' ').replace(/\s+/g, ' ').trim();
+    if (opts && opts.title) return clean('Shelter ' + opts.title) + ext;
     if (list.length === 1) return clean((list[0].code || 'Survey') + ' ' + (list[0].family || '')) + ext;
     return 'Shelter purchase list ' + today() + ext;
   }
@@ -2067,13 +2781,13 @@
     png: { label: 'drawing image', ext: ' – drawing.png', type: 'image/png' }
   };
 
-  async function runExport(kind, list) {
+  async function runExport(kind, list, opts) {
     if (!list.length) return;
     const K = EXPORT_KIND[kind] || EXPORT_KIND.pdf;
     showSheet('<h2>Preparing ' + K.label + '…</h2><p class="muted">This takes a few seconds.</p>');
     try {
-      const blob = kind === 'png' ? await buildPng(list[0]) : kind === 'pdf' ? await buildPdf(list) : await buildPptx(list);
-      const name = exportName(list, K.ext);
+      const blob = kind === 'png' ? await buildPng(list[0]) : kind === 'pdf' ? await buildPdf(list, opts) : await buildPptx(list, opts);
+      const name = exportName(list, K.ext, kind === 'png' ? null : opts);
       lastExport = { blob, name, type: K.type };
       if (viewerUrl) URL.revokeObjectURL(viewerUrl);
       viewerUrl = kind === 'png' ? URL.createObjectURL(blob) : null;
@@ -2138,6 +2852,21 @@
     const filterEl = t.closest('[data-filter]');
     if (filterEl) { S.list.filter = filterEl.dataset.filter; renderList(); return; }
 
+    const goEl = t.closest('[data-go]');
+    if (goEl) { go(goEl.dataset.go); return; }
+
+    const dayEl = t.closest('[data-day]');
+    if (dayEl) { S.dayDraft = null; go('day-' + dayEl.dataset.day); return; }
+
+    const openHouse = t.closest('[data-openhouse]');
+    if (openHouse) { const id = openHouse.dataset.openhouse; if (isLeader()) S.stepOf[id] = 2; go('survey-' + id); return; }
+
+    const markEl = t.closest('[data-mark]');
+    if (markEl) { const hs = S.surveys.get(markEl.dataset.mark); if (hs) markHouse(hs, markEl.dataset.state); return; }
+
+    const editUser = t.closest('[data-edituser]');
+    if (editUser) { userSheet(S.users.find((u) => u.id === editUser.dataset.edituser)); return; }
+
     const pick = t.closest('[data-pick]');
     if (pick) { e.stopPropagation(); if (pick.checked) S.list.picked.add(pick.dataset.pick); else S.list.picked.delete(pick.dataset.pick); renderList(); return; }
 
@@ -2152,13 +2881,13 @@
     }
 
     const add = t.closest('[data-addroom]');
-    if (add && s) { addRoom(s, add.dataset.addroom); return; }
+    if (add && s) { if (canEdit(s)) addRoom(s, add.dataset.addroom); return; }
 
     const viewp = t.closest('[data-viewpaper]');
     if (viewp && s) { viewPaper(s, viewp.dataset.viewpaper); return; }
 
     const delp = t.closest('[data-delpaper]');
-    if (delp && s) {
+    if (delp && s && canAddPapers(s)) {
       const id = delp.dataset.delpaper;
       s.papers = (s.papers || []).filter((p) => p.id !== id);
       DB.del('files', id).catch(() => {});
@@ -2167,18 +2896,59 @@
     }
 
     const st = t.closest('[data-setstatus]');
-    if (st && s) {
-      s.status = st.dataset.setstatus;
-      if (s.status === 'Approved' && !String(s.reviewer || '').trim()) s.reviewer = S.me.name;
-      touch(s); renderEditor(s.id); toast('Status: ' + s.status);
-      return;
-    }
+    if (st && s) { setStatus(s, st.dataset.setstatus); return; }
 
     if (!actEl) return;
     const act = actEl.dataset.act;
     switch (act) {
-      case 'back': go(''); break;
+      case 'back': go(S.backTo || ''); break;
+      case 'go-days': S.dayDraft = null; go('days'); break;
       case 'new': newSurvey(); break;
+      case 'new-day': S.dayDraft = null; go('day-new'); break;
+      case 'save-day': saveDay(); break;
+      case 'delete-day': {
+        if (removeArm.get('day')) { removeArm.delete('day'); deleteDay(); }
+        else {
+          removeArm.set('day', true); actEl.textContent = 'Tap again to delete the day';
+          setTimeout(() => { removeArm.delete('day'); if (actEl.isConnected) actEl.textContent = 'Delete day'; }, 4000);
+        }
+        break;
+      }
+      case 'export-day': {
+        const id = (S.dayDraft && S.dayDraft.id) || (location.hash.match(/day-(.+)$/) || [])[1];
+        const task = S.tasks.find((x) => x.id === id);
+        const list = S.dayDraft ? Array.from(S.dayDraft.picked).map((x) => S.surveys.get(x)).filter(Boolean) : task ? taskSurveys(task) : [];
+        const name = S.dayDraft ? (S.dayDraft.name || 'Implementation day') : task ? task.name : 'Implementation day';
+        const date = S.dayDraft ? S.dayDraft.date : task ? task.date : '';
+        const leader = S.dayDraft ? ((S.leaders.find((l) => l.id === S.dayDraft.leaderId) || {}).name || '') : task ? leaderNameOf(task) : '';
+        runExport(actEl.dataset.kind, list, { title: name + (date ? ' · ' + date : ''), leader, summary: isMgr() });
+        break;
+      }
+      case 'add-user': userSheet(null); break;
+      case 'cancel-invite': S.invite = null; route(); break;
+      case 'gen-code': { const c = $('#u-code'); if (c) c.value = randomCode(); break; }
+      case 'copy-user-invite': {
+        const code = $('#u-code') ? $('#u-code').value.trim() : '';
+        const name = $('#u-name') ? $('#u-name').value.trim() : '';
+        const text = 'Shelter Surveys – ' + name + '\nOpen this link, install the app, and log in:\n' + inviteLink(code) + '\nYour personal code: ' + code + ' (keep it to yourself)';
+        if (!(await copyText(text))) { const m = $('#u-msg'); if (m) m.innerHTML = '<textarea readonly rows="5">' + esc(text) + '</textarea>'; }
+        break;
+      }
+      case 'logout': {
+        if (removeArm.get('logout') || !pendingCount()) { removeArm.delete('logout'); logout(); }
+        else {
+          removeArm.set('logout', true); actEl.textContent = 'Not uploaded yet: tap again to log out anyway';
+          setTimeout(() => { removeArm.delete('logout'); if (actEl.isConnected) actEl.textContent = 'Log out'; }, 5000);
+        }
+        break;
+      }
+      case 'gps': if (s && canEdit(s)) captureLocation(s); break;
+      case 'gps-clear': {
+        if (!s || !canEdit(s)) break;
+        s.location = null; s.locationCleared = true; touch(s);
+        const panel = $('#locPanel'); if (panel) panel.outerHTML = locationHtml(s, false);
+        break;
+      }
       case 'go-rules': go('rules'); break;
       case 'go-me': go('me'); break;
       case 'install':
@@ -2207,17 +2977,12 @@
         break;
       }
       case 'sync-now': closeSheet(); S.sync.state = 'idle'; syncNow(); if (currentView === 'me') setTimeout(renderMe, 1500); break;
-      case 'copy-invite': {
-        const link = location.origin + location.pathname + '?api=' + encodeURIComponent(apiUrl()) + '&team=' + encodeURIComponent(S.me.key || '');
-        const box = $('#inviteText');
-        try { await navigator.clipboard.writeText(link); toast('Invite link copied'); }
-        catch (err) { if (box) { box.hidden = false; box.value = link; box.select(); } toast('Copy the link from the box'); }
-        break;
-      }
+      case 'copy-invite': copyText(inviteLink(''), $('#inviteText')); break;
       case 'reset': {
         if (removeArm.get('reset')) {
           await DB.clear();
           S.surveys.clear(); S.me = null; S.lastPull = ''; removeArm.delete('reset');
+          S.tasks = []; S.users = []; S.leaders = []; S.pendingDeletes = []; S.pendingStates = []; S.pendingTasks = []; S.needLogin = '';
           go('');
         } else {
           removeArm.set('reset', true); actEl.textContent = 'Tap again to erase this phone';
@@ -2227,7 +2992,7 @@
       }
       case 'swap-beams': {
         // same room outline, beams turn 90°: beam side and plank side swap
-        if (!s || !S.cur.sel) break;
+        if (!s || !S.cur.sel || !canEdit(s)) break;
         const r = s.rooms.find((x) => x.id === S.cur.sel);
         const pl = s.layout.rooms[S.cur.sel];
         if (!r || !pl) break;
@@ -2238,14 +3003,14 @@
         break;
       }
       case 'rotate': {
-        if (!s || !S.cur.sel) break;
+        if (!s || !S.cur.sel || !canEdit(s)) break;
         const pl = s.layout.rooms[S.cur.sel];
         if (pl) { pl.rot = pl.rot ? 0 : 1; touch(s); renderPlan(); }
         break;
       }
-      case 'tidy': if (s) { tidyLayout(s); touch(s); renderPlan(); } break;
+      case 'tidy': if (s && canEdit(s)) { tidyLayout(s); touch(s); renderPlan(); } break;
       case 'remove-room': {
-        if (!s) break;
+        if (!s || !canEdit(s)) break;
         const card = actEl.closest('.room');
         const rid = card.dataset.rid;
         if (removeArm.get(rid)) {
@@ -2263,7 +3028,7 @@
         break;
       }
       case 'delete-survey': {
-        if (!s) break;
+        if (!s || !canDelete(s)) break;
         if (removeArm.get('delete')) { removeArm.delete('delete'); deleteSurvey(s); }
         else {
           removeArm.set('delete', true); actEl.textContent = 'Tap again to delete it everywhere';
@@ -2276,7 +3041,7 @@
   });
 
   document.addEventListener('keydown', (e) => {
-    if ((e.key === 'Enter' || e.key === ' ') && e.target.matches && e.target.matches('.card[data-open]')) { e.preventDefault(); e.target.click(); }
+    if ((e.key === 'Enter' || e.key === ' ') && e.target.matches && e.target.matches('.card[data-open], .card[data-day], .card[data-edituser]')) { e.preventDefault(); e.target.click(); }
     if (e.key === 'Escape') closeSheet();
   });
 
@@ -2284,10 +3049,12 @@
     const s = curSurvey();
     if (!s) return;
     const t = e.target;
+    if ((t.dataset.f || t.dataset.rf) && !canEdit(s)) return;
     if (t.dataset.f) {
       s[t.dataset.f] = t.value;
       touch(s);
       if (t.dataset.f === 'family') { const h = $('#title'); if (h) h.textContent = t.value || 'New survey'; }
+      if (t.dataset.f === 'nationalId' || t.dataset.f === 'mobile') updateDupWarn(s);
       return;
     }
     if (t.dataset.rf) {
@@ -2308,11 +3075,18 @@
   document.addEventListener('change', async (e) => {
     const t = e.target;
     const s = curSurvey();
-    if (t.dataset.rf === 'roof' || t.dataset.rf === 'grade' || t.dataset.f === 'status' || t.dataset.f === 'grade') {
+    if (t.dataset.rf === 'roof' || t.dataset.rf === 'grade' || t.dataset.f === 'grade') {
       t.dispatchEvent(new Event('input', { bubbles: true }));
       return;
     }
-    if (t.matches('input[type="file"][data-paper]') && s) {
+    if (t.matches('[data-statuspick]') && s) { setStatus(s, t.value); return; }
+    if (t.matches('[data-dpick]') && S.dayDraft) {
+      if (t.checked) S.dayDraft.picked.add(t.dataset.dpick); else S.dayDraft.picked.delete(t.dataset.dpick);
+      const row = t.closest('.pick-row'); if (row) row.classList.toggle('on', t.checked);
+      renderDayTotals();
+      return;
+    }
+    if (t.matches('input[type="file"][data-paper]') && s && canAddPapers(s)) {
       const type = paperTypes(s)[Number(t.dataset.paper)];
       const files = Array.from(t.files || []);
       t.value = '';
@@ -2333,9 +3107,9 @@
   function readInvite() {
     try {
       const q = new URLSearchParams(location.search);
-      const api = q.get('api'), team = q.get('team');
-      if (api || team) {
-        S.invite = { api: api || '', team: team || '' };
+      const api = q.get('api'), code = q.get('code');
+      if (api || code) {
+        S.invite = { api: api || '', code: code || '' };
         history.replaceState(null, '', location.pathname + location.hash);
       }
     } catch (e) { /* ignore */ }
@@ -2352,9 +3126,10 @@
     L[rooms[3].id] = { x: 7, y: 0, rot: 0 };
     L[rooms[4].id] = { x: 7, y: 2, rot: 0 };
     const s = {
-      id, code: 'EXAMPLE', status: 'Draft', project: 'Roofing Wadi El Natron Team', area: 'Example village', researcher: 'Demo researcher', reviewer: '',
+      id, code: 'EXAMPLE', status: 'Approved', project: 'Ismailia Project', area: 'Example village', researcher: 'Ahmed (example)', reviewer: 'Ali (example)', approvedBy: 'Begad (preview)',
       date: today(), family: 'Example family', age: '', members: '6', grade: 'B+', nationalId: '', job: '', income: '', mobile: '', notes: 'Example survey to try the app.',
-      rooms, layout: { rooms: L }, papers: [], createdAt: nowIso(), updatedAt: nowIso(), base: '', dirty: false, isNew: false
+      rooms, layout: { rooms: L }, papers: [], createdAt: nowIso(), updatedAt: nowIso(), base: '', dirty: false, isNew: false,
+      location: { lat: 30.596512, lng: 32.271499, acc: 9, at: nowIso() }
     };
     S.surveys.set(id, s);
     DB.put('surveys', s).catch(() => {});
@@ -2374,19 +3149,37 @@
       S.lastPull = (await DB.meta('lastPull')) || '';
       S.lastSyncAt = (await DB.meta('lastSyncAt')) || 0;
       S.pendingDeletes = (await DB.meta('pendingDeletes')) || [];
+      S.pendingStates = (await DB.meta('pendingStates')) || [];
+      S.pendingTasks = (await DB.meta('pendingTasks')) || [];
+      S.tasks = (await DB.meta('tasks')) || [];
+      S.leaders = (await DB.meta('leaders')) || [];
+      S.users = (await DB.meta('users')) || [];
       (await DB.all('surveys')).forEach((s) => { if (!s.isNew) S.surveys.set(s.id, s); });
     } catch (e) { /* start empty */ }
     readInvite();
-    if (S.invite && S.me) {
-      S.me = Object.assign({}, S.me, S.invite.api ? { api: S.invite.api } : {}, S.invite.team ? { key: S.invite.team } : {});
+    if (S.invite && S.me && S.invite.api) {
+      S.me = Object.assign({}, S.me, { api: cleanApi(S.invite.api) });
       DB.setMeta('me', S.me).catch(() => {});
-      S.invite = null;
-      toast('Connected to the team sheet');
+      if (!S.invite.code) { S.invite = null; toast('Connected to the team sheet'); }
     }
-    if (CFG.demo && !S.me) {
-      S.me = { name: 'Demo researcher', key: '', api: '', deviceId: uid() };
+    if (S.invite && S.invite.code && S.me && S.me.role && normCodeLocal(S.me.key) === normCodeLocal(S.invite.code)) S.invite = null; // already logged in with it
+    // Phones set up before personal codes (1.4 and older): log in once more with your own code. Surveys stay.
+    if (!CFG.demo && S.me && S.me.key && !S.me.role) {
+      S.needLogin = 'Shelter Surveys now gives everyone their own code. Ask an admin for yours. Surveys on this phone are kept and upload after you log in.';
+    }
+    if (CFG.demo && (!S.me || !S.me.role)) {
+      S.me = { name: 'Begad (preview)', role: 'Admin', id: 'demo-admin', key: '', api: '', deviceId: uid() };
       DB.setMeta('me', S.me).catch(() => {});
       if (!S.surveys.size) seedDemo();
+    }
+    if (CFG.demo) {
+      if (!S.leaders.length) S.leaders = [{ id: 'demo-tl', name: 'Tarek (example)' }];
+      if (!S.users.length) S.users = [
+        { id: 'demo-admin', name: 'Begad (preview)', role: 'Admin', code: 'begd-1234', active: true },
+        { id: 'demo-tl', name: 'Tarek (example)', role: 'Team leader', code: 'trk7-5521', active: true },
+        { id: 'demo-rv', name: 'Ali (example)', role: 'Reviewer', code: 'alix-8830', active: true },
+        { id: 'demo-rs', name: 'Ahmed (example)', role: 'Researcher', code: 'ahm3-4410', active: true }
+      ];
     }
     window.addEventListener('hashchange', route);
     window.addEventListener('online', () => { S.sync.state = 'idle'; updateSyncPill(); scheduleSync(400); });

@@ -1,7 +1,7 @@
 /* Shelter Surveys – keeps the app available without internet.
  * Change VERSION whenever you upload new app files, so phones fetch the update.
  */
-const VERSION = 'shelter-v1.4.0';
+const VERSION = 'shelter-v1.5.0';
 const SHELL = [
   './',
   './index.html',
@@ -17,7 +17,8 @@ const SHELL = [
   './barlow-condensed-600.woff2',
   './barlow-condensed-700.woff2',
   './jspdf.umd.min.js',
-  './pptxgen.bundle.js'
+  './pptxgen.bundle.js',
+  './qrcode.js'
 ];
 
 // Save each file on its own: one missing file must not stop the rest from working offline.
