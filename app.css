@@ -400,3 +400,19 @@ table.wood .sw { display: inline-block; width: 12px; height: 12px; border-radius
 .code-row { display: flex; gap: 8px; }
 .code-row input { flex: 1; min-width: 0; }
 .sheet .fields { gap: 12px; }
+
+/* one-tap roles, history (1.5.1) */
+.role-pick { display: grid; gap: 8px; margin-top: 14px; }
+.role-btn {
+  display: grid; gap: 2px; text-align: start; padding: 12px 14px; border-radius: var(--r-sm); cursor: pointer;
+  border: 1px solid var(--line); background: var(--surface); color: var(--ink);
+}
+.role-btn b { font-size: 1rem; }
+.role-btn span { font-size: .82rem; color: var(--muted); }
+.role-btn.on { border: 2px solid var(--brand); background: var(--brand-soft); padding: 11px 13px; }
+.role-btn:disabled { opacity: .6; cursor: wait; }
+.history { list-style: none; margin: 0; padding: 0; display: grid; gap: 0; max-height: 60vh; overflow-y: auto; border-top: 1px solid var(--line); }
+.history li { padding: 10px 2px; border-bottom: 1px solid var(--line); display: grid; gap: 2px; }
+.history .h-top { display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; align-items: baseline; }
+.history .h-act { font-size: .85rem; font-weight: 600; color: var(--brand); }
+.history .h-changes { font-size: .88rem; overflow-wrap: anywhere; }

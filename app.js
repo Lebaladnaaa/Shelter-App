@@ -13,10 +13,11 @@
     pptx: 'pptxgen.bundle.js',
     qr: 'qrcode.js'
   }, CFG.assets || {});
-  const APP_VERSION = '1.5.0';
+  const APP_VERSION = '1.5.1';
 
   const STATUSES = ['Draft', 'Submitted', 'Reviewed', 'Approved', 'Roofed', 'Cancelled'];
-  const ROLES = ['Admin', 'Manager', 'Team leader', 'Reviewer', 'Researcher'];
+  const ROLES = ['Admin', 'Manager', 'Team leader', 'Researcher']; // researchers also review
+  const TEAM_ROLES = ['Researcher', 'Team leader', 'Manager']; // what admins give with one tap
   const ROOM_NAMES = ['Bedroom', 'Kitchen', 'Bathroom', 'Hall', 'Reception', 'Stairs', 'Animal pen', 'Storage', 'Courtyard'];
   const GRADES = ['A', 'B+', 'B', 'C'];
   const ROOM_COLORS = [
@@ -96,6 +97,14 @@
   }
   const isIOS = () => /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
   const isAndroid = () => /android/i.test(navigator.userAgent);
+  function deviceName() {
+    const ua = navigator.userAgent || '';
+    const os = isIOS() ? (/ipad/i.test(ua) || navigator.maxTouchPoints > 1 && /mac/i.test(ua) ? 'iPad' : 'iPhone')
+      : isAndroid() ? 'Android' + (/mobile/i.test(ua) ? ' phone' : ' tablet')
+        : /windows/i.test(ua) ? 'Windows PC' : /mac/i.test(ua) ? 'Mac' : /linux/i.test(ua) ? 'Linux PC' : 'Computer';
+    const br = /SamsungBrowser/.test(ua) ? 'Samsung Internet' : /Edg\//.test(ua) ? 'Edge' : /CriOS|Chrome/.test(ua) ? 'Chrome' : /Firefox|FxiOS/.test(ua) ? 'Firefox' : /Safari/.test(ua) ? 'Safari' : '';
+    return os + (br ? ' · ' + br : '') + (isStandalone() ? ' · app' : '');
+  }
   const isStandalone = () => (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) || window.navigator.standalone === true;
 
   let toastTimer = null;
@@ -291,7 +300,8 @@
     tasks: [], // implementation days (managers: all; team leaders: theirs)
     leaders: [], // team leaders, for managers planning a day
     users: [], // admins: everyone, with codes
-    needLogin: '' // set when the sheet stops accepting this phone's code
+    needLogin: '', // set when the sheet stops accepting this phone's code
+    teamCode: '' // admins: the shared code, for invite links
   };
 
   /* ═════════════════════ Roles: what this person may do ═════════════════════ */
@@ -301,30 +311,29 @@
   const isLeader = () => role() === 'Team leader';
   const normName = (v) => String(v == null ? '' : v).replace(/\s+/g, ' ').trim().toLowerCase();
   function isOwner(s) {
-    if (s.createdById) return !!S.me && s.createdById === S.me.id;
+    if (!S.me) return false;
+    if (s.createdById && s.createdById === S.me.id) return true;
     if (!s.code && !s.base) return true; // made on this phone, not uploaded yet
-    return !!s.researcher && !!S.me && normName(s.researcher) === normName(S.me.name);
+    return !!s.researcher && normName(s.researcher) === normName(S.me.name);
   }
-  /** Same rules as the sheet: who may change a survey's family, rooms, plan and papers. */
+  const approved = (s) => s.status === 'Approved' || s.status === 'Roofed';
+  /** Same rules as the sheet. Researchers (who also review): any survey until a manager approves it. */
   function canEdit(s) {
     if (!s || CFG.demo) return !!s;
     if (isMgr()) return true;
-    if (role() === 'Reviewer') return s.status !== 'Roofed';
-    if (role() === 'Researcher') return isOwner(s) && (!s.status || s.status === 'Draft' || s.status === 'Submitted');
+    if (role() === 'Researcher') return !approved(s);
     return false;
   }
   function canDelete(s) {
     if (CFG.demo || isMgr()) return true;
-    if (role() === 'Researcher' || role() === 'Reviewer') return isOwner(s) && s.status !== 'Approved' && s.status !== 'Roofed';
+    if (role() === 'Researcher') return isOwner(s) && !approved(s);
     return false;
   }
   const canAddPapers = (s) => canEdit(s) || (!isLeader() && isOwner(s));
   function whyReadOnly(s) {
     if (isLeader()) return 'View only. Team leaders see the drawing and mark houses roofed.';
-    if (role() === 'Researcher' && !isOwner(s)) return 'View only. Surveyed by ' + (s.researcher || 'someone else') + '; only they, reviewers and managers can change it.';
-    if (role() === 'Researcher') return 'View only. It is ' + (s.status || '').toLowerCase() + ', so only reviewers and managers can change it now.';
     if (s.status === 'Roofed') return 'View only. This house is roofed; only managers can change it.';
-    return 'View only.';
+    return 'View only. It is approved, so only managers can change it now.';
   }
   const taskOf = (s) => S.tasks.find((t) => (t.surveyIds || []).indexOf(s.id) >= 0) || null;
   /** Google adds /u/0/, /u/1/… when several accounts are signed in; that form fails for everyone else. */
@@ -397,7 +406,7 @@
       res = await fetch(apiUrl(), {
         method: 'POST',
         headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify(Object.assign({ action, key: S.me.key, by: S.me.name, device: S.me.deviceId, v: APP_VERSION }, body || {})),
+        body: JSON.stringify(Object.assign({ action, key: S.me.key, uid: S.me.id || '', token: S.me.token || '', name: S.me.name, by: S.me.name, device: S.me.deviceId, deviceName: deviceName(), v: APP_VERSION }, body || {})),
         redirect: 'follow',
         signal: ctrl ? ctrl.signal : undefined
       });
@@ -427,13 +436,14 @@
 
   async function syncNow() {
     clearTimeout(syncTimer);
-    if (CFG.demo || !S.me || !S.me.role || S.needLogin || !apiUrl() || !S.me.key) { updateSyncPill(); return; }
+    if (CFG.demo || !S.me || !S.me.name || S.needLogin || !apiUrl() || !S.me.key) { updateSyncPill(); return; }
     if (syncing) { syncAgain = true; return; }
     if (navigator.onLine === false) { S.sync.state = 'offline'; updateSyncPill(); return; }
     syncing = true;
     S.sync.state = 'busy';
     updateSyncPill();
     try {
+      if (!S.me.role || !S.me.id) await identify(); // phones from before 1.5: the sheet adds them by name
       await pushDeletes();
       await pushSurveys();
       await pushPapers();
@@ -446,8 +456,19 @@
     } catch (e) {
       if (e.code === 'offline') S.sync = { state: 'offline', msg: e.message };
       else if (e.code === 'bad_key') {
-        S.sync = { state: 'badkey', msg: 'Your code is no longer accepted. Ask an admin for your code and enter it again. Nothing on this phone is lost.' };
-        S.needLogin = 'Your code has changed or was switched off. Enter your personal code to continue. Nothing on this phone is lost.';
+        S.sync = { state: 'badkey', msg: 'The code is no longer accepted. Enter the new code. Nothing on this phone is lost.' };
+        S.needLogin = 'The team code has changed. Type the new code to continue. Nothing on this phone is lost.';
+        setTimeout(route, 0);
+      }
+      else if (e.code === 'need_login') { // this phone's key is not in the Users tab any more: join again by name
+        S.me = Object.assign({}, S.me, { id: '', token: '', role: S.me.role });
+        await DB.setMeta('me', S.me);
+        S.sync = { state: 'wait', msg: 'Logging in again…' };
+        syncAgain = true;
+      }
+      else if (e.code === 'blocked') {
+        S.sync = { state: 'badkey', msg: 'An admin switched off your access. Nothing on this phone is lost.' };
+        S.needLogin = 'An admin switched off your access to the app. Ask Begad or Hawary. Nothing on this phone is lost.';
         setTimeout(route, 0);
       }
       else if (e.code === 'busy') { S.sync = { state: 'wait', msg: 'The sheet was busy. Trying again shortly.' }; scheduleSync(8000); }
@@ -607,16 +628,25 @@
     }
   }
 
+  /** Who am I: the sheet adds this phone by name the first time (and gives it a hidden key). */
+  async function identify() {
+    const res = await api('ping', {}, 30000);
+    await applyConfig(res);
+    await applyMe(res);
+    await applyTeam(res);
+  }
+
   /** The sheet tells us who we are on every sync: an admin may have changed our role or name. */
   async function applyMe(res) {
     if (!res || !res.me || !S.me) return;
     const was = S.me.role;
-    S.me = Object.assign({}, S.me, { id: res.me.id, name: res.me.name, role: res.me.role });
+    S.me = Object.assign({}, S.me, { id: res.me.id, name: res.me.name, role: res.me.role }, res.me.token ? { token: res.me.token } : {});
     await DB.setMeta('me', S.me);
     if (was && was !== S.me.role) { S.lastPull = ''; toast('Your role is now: ' + S.me.role); setTimeout(route, 0); }
   }
 
   async function applyTeam(res) {
+    if (res.teamCode) { S.teamCode = res.teamCode; await DB.setMeta('teamCode', S.teamCode); }
     if (res.leaders) { S.leaders = res.leaders; await DB.setMeta('leaders', S.leaders); }
     if (res.users) { S.users = res.users; await DB.setMeta('users', S.users); }
     if (res.tasks) {
@@ -716,7 +746,8 @@
 
   function route() {
     const h = decodeURIComponent(location.hash.replace(/^#/, ''));
-    const ready = S.me && S.me.name && S.me.role && !S.needLogin && (CFG.demo || (S.me.key && apiUrl()));
+    if (updateReady && h.indexOf('survey-') !== 0 && h.indexOf('day-') !== 0) { restartForUpdate(); return; }
+    const ready = S.me && S.me.name && !S.needLogin && (CFG.demo || (S.me.key && apiUrl()));
     if (!ready || (S.invite && S.invite.code)) { renderWelcome(); return; }
     if (h.indexOf('survey-') === 0) {
       const id = h.slice(7);
@@ -787,30 +818,34 @@
       installHelp(false) +
       '<form class="panel" id="welcomeForm" novalidate>' +
       '<div class="fields">' +
-      '<label class="field wide"><span>Your personal code</span><input type="text" id="w-key" autocapitalize="off" autocomplete="off" value="' + esc(inv.code || '') + '" required><small>An admin gives each person their own code. It tells the app who you are and what you can do.</small></label>' +
+      '<label class="field wide"><span>Your name</span><input type="text" id="w-name" dir="auto" autocomplete="name" value="' + esc(me.name || '') + '" required><small>Full name, the way the team knows you. It goes on every survey you make or change.</small></label>' +
+      '<label class="field wide"><span>Code</span><input type="text" id="w-key" autocapitalize="off" autocomplete="off" value="' + esc(inv.code || (S.needLogin ? '' : me.key) || '') + '" required><small>The team code. (Admins: your own code.)</small></label>' +
       '<label class="field wide"' + (needApi ? '' : ' hidden') + '><span>Sheet connection link</span><input type="url" id="w-api" inputmode="url" autocapitalize="off" value="' + esc(inv.api || me.api || '') + '" placeholder="https://script.google.com/macros/s/…/exec"><small>Only needed if you did not get an invite link.</small></label>' +
       '</div>' +
       '<div id="w-msg"></div>' +
-      '<div class="btn-row"><button class="btn" type="submit" id="w-go">Log in</button>' +
-      (S.invite && S.invite.code && me.role && !S.needLogin ? '<button type="button" class="btn quiet" data-act="cancel-invite">Stay logged in as <bdi>' + esc(me.name) + '</bdi></button>' : '') + '</div>' +
+      '<div class="btn-row"><button class="btn" type="submit" id="w-go">Log in</button></div>' +
       '<p class="small muted" style="margin:0">The first log-in needs internet. After that the app works offline.</p>' +
       '</form></div></main>';
     $('#welcomeForm').addEventListener('submit', async (e) => {
       e.preventDefault();
+      const name = $('#w-name').value.replace(/\s+/g, ' ').trim();
       const key = $('#w-key').value.trim();
       const link = cleanApi($('#w-api').value.trim() || CFG.apiUrl || '');
       const msg = $('#w-msg');
+      $('#w-name').classList.toggle('bad', name.length < 2);
       $('#w-key').classList.toggle('bad', !key);
-      if (!key) { msg.innerHTML = '<div class="notice err">Type your personal code.</div>'; return; }
+      if (name.length < 2 || !key) { msg.innerHTML = '<div class="notice err">Type your name and the code.</div>'; return; }
       if (!link) { msg.innerHTML = '<div class="notice err">Paste the sheet connection link from your invite.</div>'; return; }
       const before = S.me;
-      S.me = Object.assign({ deviceId: uid() }, S.me || {}, { key, api: link });
+      const samePerson = before && before.id && before.token && normName(before.name) === normName(name);
+      // a different name on this phone = a different person: they join as themselves
+      S.me = Object.assign({ deviceId: uid() }, before || {}, { name, key, api: link }, samePerson ? {} : { id: '', token: '', role: '' });
       $('#w-go').disabled = true;
-      msg.innerHTML = '<div class="notice info">Checking your code…</div>';
+      msg.innerHTML = '<div class="notice info">Checking the code…</div>';
       try {
-        const res = await api('ping', {}, 20000);
+        const res = await api('ping', {}, 30000);
         await applyConfig(res);
-        S.me = Object.assign({}, S.me, { id: res.me.id, name: res.me.name, role: res.me.role });
+        S.me = Object.assign({}, S.me, { id: res.me.id, name: res.me.name, role: res.me.role }, res.me.token ? { token: res.me.token } : {});
         if (!before || !before.id || before.id !== S.me.id) { // first log-in, or a different person on this phone: download everything again
           S.lastPull = ''; await DB.setMeta('lastPull', '');
           S.tasks = []; S.users = []; S.leaders = [];
@@ -819,7 +854,7 @@
       } catch (err) {
         S.me = before;
         $('#w-go').disabled = false;
-        if (err.code === 'bad_key') { msg.innerHTML = '<div class="notice err">That code is not accepted. Check it with an admin.</div>'; return; }
+        if (err.code === 'bad_key') { msg.innerHTML = '<div class="notice err">That code is not accepted. Check the team code.</div>'; return; }
         if (err.code === 'offline') { msg.innerHTML = '<div class="notice err">No internet. The first log-in needs internet once.</div>'; return; }
         msg.innerHTML = '<div class="notice err">' + esc(err.message) + '</div>';
         return;
@@ -892,7 +927,7 @@
       (hideInstall ? '' : installHelp(true)) +
       (DB.memoryOnly ? '<div class="notice err"><b>This browser cannot keep surveys offline.</b> Install the app or use Chrome / Safari normally (not a private window).</div>' : '') +
       rulesNote +
-      (role() === 'Reviewer' && count((s) => s.status === 'Submitted') ? '<div class="notice info small"><div><b>' + count((s) => s.status === 'Submitted') + ' submitted</b> waiting for review. <button class="linkbtn" data-filter="Submitted">Show them</button></div></div>' : '') +
+      (role() === 'Researcher' && count((s) => s.status === 'Submitted') ? '<div class="notice info small"><div><b>' + count((s) => s.status === 'Submitted') + ' submitted</b> waiting for review. <button class="linkbtn" data-filter="Submitted">Show them</button></div></div>' : '') +
       '<div class="search-row"><input type="search" id="q" dir="auto" placeholder="Search name, area, code, phone or ID" value="' + esc(S.list.q) + '" aria-label="Search surveys">' +
       (isMgr() ? '<button class="btn ghost" data-act="toggle-select">' + (sel ? 'Done' : 'Select') + '</button>' : '') + '</div>' +
       '<div class="chips" role="group" aria-label="Filter surveys">' + chips.map((c) =>
@@ -1057,13 +1092,10 @@
       if (st === 'Cancelled') out.push(b('Draft', 'Restore'));
       out.push('<label class="status-pick"><span class="small muted">Status</span><select data-statuspick aria-label="Set status">' +
         STATUSES.map((x) => '<option' + (x === st ? ' selected' : '') + '>' + x + '</option>').join('') + '</select></label>');
-    } else if (role() === 'Reviewer') {
-      if (st === 'Draft' || st === 'Submitted') out.push(b('Reviewed', 'Mark reviewed', 'leaf'));
-      if (st === 'Submitted') out.push(b('Draft', 'Send back to researcher'));
+    } else if (role() === 'Researcher') { // records and reviews
+      if (st === 'Draft') out.push(b('Submitted', 'Submit for review', 'leaf'), b('Reviewed', 'Mark reviewed'));
+      if (st === 'Submitted') out.push(b('Reviewed', 'Mark reviewed', 'leaf'), b('Draft', 'Back to draft'));
       if (st === 'Reviewed') out.push(b('Submitted', 'Undo review'));
-    } else if (role() === 'Researcher') {
-      if (isOwner(s) && st === 'Draft') out.push(b('Submitted', 'Submit for review', 'leaf'));
-      if (isOwner(s) && st === 'Submitted') out.push(b('Draft', 'Back to draft'));
     } else if (isLeader() && taskOf(s)) {
       if (st === 'Roofed') out.push(b('Pending', 'Mark pending'));
       else out.push(b('Roofed', 'Mark roofed', 'leaf'));
@@ -1072,13 +1104,14 @@
   }
 
   function statusPanel(s, full) {
+    const hist = full && !isLeader() && s.base ? '<button class="btn quiet sm" data-act="history">History</button>' : '';
     const acts = statusActions(s);
     const missingPapers = full && !isLeader() ? paperTypes(s).filter((t) => t.required && !(s.papers || []).some((p) => p.paper === t.name)) : [];
     const waitingMark = S.pendingStates.some((x) => x.surveyId === s.id);
     return '<section class="panel status-panel"><div class="panel-head"><h2>Status</h2><span class="status st-' + esc(s.status || 'Draft') + '">' + esc(s.status || 'Draft') + '</span></div>' +
       '<div class="small muted">' + peopleLine(s) + (waitingMark ? ' · <b>mark waiting to upload</b>' : '') + '</div>' +
       (missingPapers.length ? '<div class="notice warn small"><div>Missing required papers: <span dir="auto">' + missingPapers.map((t) => esc(t.name)).join(', ') + '</span></div></div>' : '') +
-      (acts ? '<div class="btn-row status-row">' + acts + '</div>' : '') +
+      (acts || hist ? '<div class="btn-row status-row">' + acts + hist + '</div>' : '') +
       '</section>';
   }
 
@@ -1739,7 +1772,7 @@
       '<main class="page"><div class="page-inner">' +
       '<section class="panel"><div class="panel-head"><h2>You</h2><span class="status st-Submitted">' + esc(role()) + '</span></div>' +
       '<div class="me-line"><b dir="auto">' + esc(S.me.name || '') + '</b><span class="small muted">' + esc(roleHelp(role())) + '</span></div>' +
-      '<p class="small muted" style="margin:0">Your name and role come from your personal code. Only an admin can change them.</p>' +
+      '<p class="small muted" style="margin:0">' + (isAdmin() ? 'You log in with your own admin code. Change it in Users → your name.' : 'Your role is set by the admins (Begad and Hawary). It changes on this phone at the next sync.') + '</p>' +
       (CFG.demo ? '' : '<div class="btn-row"><button class="btn ghost" data-act="logout">Log out</button></div>' +
         '<p class="small muted" style="margin:0">Use this when another person takes over this phone. Surveys stay on the phone.' + (p ? ' <b>' + p + ' item(s) are not uploaded yet: sync first, or they upload under the next person\'s name.</b>' : '') + '</p>') +
       '</section>' +
@@ -1753,7 +1786,7 @@
       (S.sync.msg ? '<div class="notice ' + (S.sync.state === 'offline' ? 'warn' : 'err') + ' small"><div>' + esc(S.sync.msg) + '</div></div>' : '') +
       '<div class="btn-row"><button class="btn ghost" data-act="sync-now">Sync now</button></div></section>' +
       (isMgr() && !CFG.demo ? '<section class="panel"><div class="panel-head"><h2>Invite people</h2></div>' +
-        '<p class="small muted" style="margin:0">This link opens the app already connected to the sheet. Each person then types the personal code an admin gave them' + (isAdmin() ? ' (Users → a person → Copy invite also puts their code in the link)' : '') + '.</p>' +
+        '<p class="small muted" style="margin:0">Send this link in the team WhatsApp group. It opens the app connected to the sheet with the team code filled in; each person only types their name.' + (isAdmin() && S.teamCode ? ' Team code: <b class="data">' + esc(S.teamCode) + '</b>.' : '') + '</p>' +
         '<div class="btn-row"><button class="btn ghost" data-act="copy-invite">Copy invite link</button></div><input type="text" id="inviteText" readonly hidden></section>' : '') +
       (isStandalone() ? '' : '<section class="panel"><div class="panel-head"><h2>Install</h2></div>' + installHelp(false) + '</section>') +
       '<section class="panel"><div class="panel-head"><h2>Reset this phone</h2></div>' +
@@ -1776,11 +1809,10 @@
 
   function roleHelp(r) {
     return {
-      Admin: 'Everything, plus adding people and their codes',
+      Admin: 'Everything, plus changing people\'s roles',
       Manager: 'Approves houses, plans implementation days, purchase lists',
       'Team leader': 'Sees the houses of their implementation days, marks them roofed',
-      Reviewer: 'Checks and corrects surveys, marks them reviewed',
-      Researcher: 'Records surveys; changes and deletes only their own'
+      Researcher: 'Records surveys, and reviews and corrects any survey until it is approved. Deletes only their own.'
     }[r] || '';
   }
 
@@ -2027,74 +2059,105 @@
     return out + '-' + (1000 + Math.floor(Math.random() * 9000));
   }
 
+  const teamCodeForInvite = () => (isAdmin() ? S.teamCode : (S.me && S.me.key) || '');
+
   function renderUsers() {
     currentView = 'users';
     S.cur = null;
     S.backTo = '';
     const users = S.users.slice();
-    const groups = ROLES.map((r) => [r, users.filter((u) => u.role === r).sort((a, b) => a.name.localeCompare(b.name))]).filter((g) => g[1].length);
+    const order = ['Admin', 'Manager', 'Team leader', 'Researcher'];
+    const label = { Admin: 'Admins', Manager: 'Managers', 'Team leader': 'Team leaders', Researcher: 'Researchers' };
+    const groups = order.map((r) => [r, users.filter((u) => u.role === r).sort((a, b) => (b.active - a.active) || a.name.localeCompare(b.name))]).filter((g) => g[1].length);
     app().innerHTML = appbar({ eyebrow: 'Lebaladna · Shelter · ' + (S.me.name || '') + ' (Admin)', title: 'Users', wide: true,
       actions: '<button class="iconbtn" data-act="go-me" aria-label="Settings">' + ICON.gear + '</button>' }) +
       '<main class="page wide"><div class="page-inner">' + navTabs('users') +
-      '<div class="notice info small"><div>Everyone logs in with their own code. The code decides their name and what they can do. Change a code if it leaks; that person then has to log in again. You can also edit the <b>Users</b> tab in the sheet.</div></div>' +
-      (navigator.onLine === false ? '<div class="notice warn small"><div>Offline. Adding or changing people needs internet.</div></div>' : '') +
-      (groups.length ? groups.map((g) => '<h2 class="list-title">' + esc(g[0]) + 's <span class="muted small">' + g[1].length + '</span></h2><div class="list">' +
+      '<div class="notice info small"><div>Everyone logs in with their name and the team code' + (S.teamCode ? ' <b class="data">' + esc(S.teamCode) + '</b>' : '') +
+      '. They appear here the first time and start as Researchers. Tap a person to make them Team leader or Manager, or to set them back.</div></div>' +
+      (navigator.onLine === false ? '<div class="notice warn small"><div>Offline. Changing roles needs internet.</div></div>' : '') +
+      (groups.length ? groups.map((g) => '<h2 class="list-title">' + esc(label[g[0]]) + ' <span class="muted small">' + g[1].length + '</span></h2><div class="list">' +
         g[1].map((u) => '<div class="card user-card' + (u.active ? '' : ' off') + '" role="button" tabindex="0" data-edituser="' + esc(u.id) + '">' +
           '<div class="main"><div class="fam" dir="auto">' + esc(u.name) + (u.id === S.me.id ? ' <span class="muted small">(you)</span>' : '') + '</div>' +
-          '<div class="sub"><span class="data">' + esc(u.code) + '</span>' + (u.phone ? ' · <bdi>' + esc(u.phone) + '</bdi>' : '') + '</div></div>' +
+          '<div class="sub">' + [u.device, u.lastSeen ? 'seen ' + fmtWhen(u.lastSeen) : ''].filter(Boolean).map((x) => '<bdi>' + esc(x) + '</bdi>').join(' · ') + '</div></div>' +
           '<div class="side">' + (u.active ? '' : '<span class="status st-Cancelled">Off</span>') + '</div></div>').join('') + '</div>').join('')
-        : '<div class="empty"><h2>No users loaded</h2><p>Open the app with internet to load the team.</p></div>') +
-      '</div></main>' +
-      '<button class="btn fab" data-act="add-user">' + ICON.plus + 'Add person</button>';
+        : '<div class="empty"><h2>No one yet</h2><p>People appear here after their first log-in. Open the app with internet to refresh.</p></div>') +
+      '</div></main>';
+  }
+
+  async function saveUserChange(u, change, okText) {
+    const msg = $('#u-msg');
+    if (CFG.demo) {
+      Object.assign(u, change);
+      S.leaders = S.users.filter((x) => x.active && x.role === 'Team leader').map((x) => ({ id: x.id, name: x.name }));
+      closeSheet(); renderUsers(); toast(okText + ' (preview only)');
+      return;
+    }
+    if (msg) msg.innerHTML = '<div class="notice info small"><div>Saving…</div></div>';
+    $$('#userSheet button').forEach((b) => { b.disabled = true; });
+    try {
+      const res = await api('saveUser', { user: Object.assign({ id: u.id }, change) }, 30000);
+      S.users = res.users || S.users;
+      S.leaders = S.users.filter((x) => x.active && x.role === 'Team leader').map((x) => ({ id: x.id, name: x.name }));
+      await DB.setMeta('users', S.users); await DB.setMeta('leaders', S.leaders);
+      if (u.id === S.me.id) { // your own admin code or name
+        S.me = Object.assign({}, S.me, change.code ? { key: change.code } : {}, change.name ? { name: change.name } : {});
+        await DB.setMeta('me', S.me);
+      }
+      closeSheet();
+      toast(okText, 3500);
+      route();
+    } catch (err) {
+      $$('#userSheet button').forEach((b) => { b.disabled = false; });
+      if (msg) msg.innerHTML = '<div class="notice err small"><div>' + esc(err.code === 'offline' ? 'No internet. Changing roles needs internet.' : err.message) + '</div></div>';
+    }
   }
 
   function userSheet(u) {
-    const isNew = !u;
-    u = u || { id: '', name: '', role: 'Researcher', code: randomCode(), phone: '', active: true };
-    showSheet('<h2>' + (isNew ? 'Add person' : 'Edit ' + esc(u.name)) + '</h2>' +
-      '<form id="userForm" class="fields" novalidate data-uid="' + esc(u.id) + '">' +
-      '<label class="field"><span>Name</span><input type="text" id="u-name" dir="auto" value="' + esc(u.name) + '" autocomplete="off"></label>' +
-      '<label class="field"><span>Role</span><select id="u-role">' + ROLES.map((r) => '<option' + (r === u.role ? ' selected' : '') + '>' + r + '</option>').join('') + '</select><small id="u-rolehelp">' + esc(roleHelp(u.role)) + '</small></label>' +
-      '<label class="field"><span>Personal code</span><span class="code-row"><input type="text" id="u-code" class="data" autocapitalize="off" autocomplete="off" value="' + esc(u.code) + '"><button type="button" class="btn ghost sm" data-act="gen-code">New code</button></span><small>At least 4 letters or numbers. Must be different for everyone.</small></label>' +
-      '<label class="field"><span>Phone (optional)</span><input type="tel" id="u-phone" inputmode="tel" value="' + esc(u.phone || '') + '"></label>' +
-      '<label class="toggle field wide"><input type="checkbox" id="u-active"' + (u.active ? ' checked' : '') + '>Active (can log in)</label>' +
-      '<div id="u-msg" class="field wide"></div>' +
-      '<div class="btn-row field wide"><button class="btn" type="submit">' + (isNew ? 'Add' : 'Save') + '</button>' +
-      (isNew ? '' : '<button type="button" class="btn ghost" data-act="copy-user-invite">Copy invite with code</button>') +
+    if (!u) return;
+    const admin = !!u.code || u.personal;
+    showSheet('<div id="userSheet"><h2 dir="auto">' + esc(u.name) + '</h2>' +
+      '<p class="small muted" style="margin:4px 0 0">' + esc([u.role, u.device, u.lastSeen ? 'seen ' + fmtWhen(u.lastSeen) : ''].filter(Boolean).join(' · ')) + '</p>' +
+      (admin
+        ? '<form id="adminCodeForm" class="fields" novalidate style="margin-top:14px">' +
+          '<label class="field wide"><span>Admin code</span><span class="code-row"><input type="text" id="u-code" class="data" autocapitalize="off" autocomplete="off" value="' + esc(u.code || '') + '"><button type="button" class="btn ghost sm" data-act="gen-code">New code</button></span><small>Private. Not the team code.</small></label>' +
+          '<div class="btn-row field wide"><button class="btn" type="submit">Save code</button></div></form>'
+        : '<div class="role-pick" role="group" aria-label="Role">' + TEAM_ROLES.map((r) =>
+          '<button type="button" class="role-btn' + (u.role === r ? ' on' : '') + '" data-setrole="' + esc(r) + '"' + (u.role === r ? ' aria-pressed="true"' : '') + '><b>' + esc(r) + '</b><span>' + esc(roleHelp(r)) + '</span></button>').join('') + '</div>') +
+      '<div id="u-msg"></div>' +
+      '<div class="btn-row">' + (u.id === S.me.id ? '' : '<button type="button" class="btn ' + (u.active ? 'danger' : 'ghost') + '" data-setactive="' + (u.active ? '0' : '1') + '">' + (u.active ? 'Switch off' : 'Switch on again') + '</button>') +
       '<button type="button" class="btn quiet" data-act="close-sheet">Close</button></div>' +
-      '</form>');
-    $('#u-role').addEventListener('change', (e) => { $('#u-rolehelp').textContent = roleHelp(e.target.value); });
-    $('#userForm').addEventListener('submit', async (e) => {
+      (u.active || admin ? '' : '<p class="small muted" style="margin:0">Switched off: this phone can\'t use the app. (Someone who knows the team code can still join again under a new entry; change the team code in the sheet to stop that.)</p>') +
+      '</div>');
+    S.userEdit = u;
+    const f = $('#adminCodeForm');
+    if (f) f.addEventListener('submit', (e) => {
       e.preventDefault();
-      const body = { id: u.id, name: $('#u-name').value.trim(), role: $('#u-role').value, code: $('#u-code').value.trim(), phone: $('#u-phone').value.trim(), active: $('#u-active').checked };
-      const msg = $('#u-msg');
-      if (!body.name) { msg.innerHTML = '<div class="notice err small"><div>Add a name.</div></div>'; return; }
-      if (body.code.replace(/[\s\-_.]+/g, '').length < 4) { msg.innerHTML = '<div class="notice err small"><div>The code needs at least 4 letters or numbers.</div></div>'; return; }
-      if (CFG.demo) {
-        if (!body.id) body.id = 'demo-' + uid();
-        const i = S.users.findIndex((x) => x.id === body.id);
-        if (i >= 0) S.users[i] = body; else S.users.push(body);
-        if (body.role === 'Team leader' && !S.leaders.some((l) => l.id === body.id)) S.leaders.push({ id: body.id, name: body.name });
-        closeSheet(); renderUsers(); toast('Saved (preview only)');
-        return;
-      }
-      msg.innerHTML = '<div class="notice info small"><div>Saving…</div></div>';
-      try {
-        const res = await api('saveUser', { user: body }, 30000);
-        S.users = res.users || S.users;
-        S.leaders = S.users.filter((x) => x.active && x.role === 'Team leader').map((x) => ({ id: x.id, name: x.name }));
-        await DB.setMeta('users', S.users); await DB.setMeta('leaders', S.leaders);
-        if (body.id && body.id === S.me.id) { // you changed your own code, name or role
-          S.me = Object.assign({}, S.me, { key: body.code, name: body.name, role: body.role });
-          await DB.setMeta('me', S.me);
-        }
-        closeSheet();
-        toast(body.id ? 'Saved ' + body.name : 'Added ' + body.name + ' · code ' + body.code, 4000);
-        route();
-      } catch (err) {
-        msg.innerHTML = '<div class="notice err small"><div>' + esc(err.code === 'offline' ? 'No internet. Adding or changing people needs internet.' : err.message) + '</div></div>';
-      }
+      const code = $('#u-code').value.trim();
+      if (code.replace(/[\s\-_.]+/g, '').length < 4) { $('#u-msg').innerHTML = '<div class="notice err small"><div>The code needs at least 4 letters or numbers.</div></div>'; return; }
+      saveUserChange(u, { code }, 'Code saved for ' + u.name);
     });
+  }
+
+  /* ── History of one survey ───────────────────────── */
+  async function showHistory(s) {
+    showSheet('<h2>History</h2><p class="muted">Loading…</p>');
+    if (CFG.demo) { showSheet('<h2>History</h2><p class="muted">In the installed app, every change is listed here: who, when, from which phone, and what changed. The sheet keeps a copy before and after each change (tab “History”).</p><div class="btn-row"><button class="btn" data-act="close-sheet">Close</button></div>'); return; }
+    try {
+      const res = await api('getHistory', { surveyId: s.id }, 30000);
+      const rows = res.history || [];
+      showSheet('<h2>History</h2><p class="small muted" style="margin:0">' + esc((s.code || '') + ' · ' + (s.family || '')) + ' · the sheet keeps a copy before and after each change (tab “History”).</p>' +
+        (rows.length ? '<ol class="history">' + rows.map((h) => '<li><div class="h-top"><b dir="auto">' + esc(h.who || '—') + '</b><span class="muted small">' + esc([h.role, fmtStamp(h.time)].filter(Boolean).join(' · ')) + '</span></div>' +
+          '<div class="h-act">' + esc(h.action) + (h.device ? ' <span class="muted small">· ' + esc(h.device) + '</span>' : '') + '</div>' +
+          '<div class="h-changes" dir="auto">' + esc(h.changes).replace(/; /g, '<br>') + '</div></li>').join('') + '</ol>'
+          : '<p class="muted">No changes recorded yet. (Changes made before this update are not listed.)</p>') +
+        '<div class="btn-row"><button class="btn" data-act="close-sheet">Close</button></div>');
+    } catch (err) {
+      showSheet('<h2>History</h2><div class="notice warn"><div>' + esc(err.code === 'offline' ? 'Connect to the internet to see the history.' : err.message) + '</div></div><div class="btn-row"><button class="btn" data-act="close-sheet">Close</button></div>');
+    }
+  }
+  function fmtStamp(iso) {
+    const d = new Date(iso);
+    return isNaN(d) ? String(iso || '') : d.toLocaleString(undefined, { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
   }
 
   function inviteLink(code) {
@@ -2867,6 +2930,12 @@
     const editUser = t.closest('[data-edituser]');
     if (editUser) { userSheet(S.users.find((u) => u.id === editUser.dataset.edituser)); return; }
 
+    const roleBtn = t.closest('[data-setrole]');
+    if (roleBtn && S.userEdit) { const r = roleBtn.dataset.setrole; if (r !== S.userEdit.role) saveUserChange(S.userEdit, { role: r }, S.userEdit.name + ' is now ' + r); return; }
+
+    const actBtn = t.closest('[data-setactive]');
+    if (actBtn && S.userEdit) { const on = actBtn.dataset.setactive === '1'; saveUserChange(S.userEdit, { active: on }, S.userEdit.name + (on ? ' switched on' : ' switched off')); return; }
+
     const pick = t.closest('[data-pick]');
     if (pick) { e.stopPropagation(); if (pick.checked) S.list.picked.add(pick.dataset.pick); else S.list.picked.delete(pick.dataset.pick); renderList(); return; }
 
@@ -2924,16 +2993,8 @@
         runExport(actEl.dataset.kind, list, { title: name + (date ? ' · ' + date : ''), leader, summary: isMgr() });
         break;
       }
-      case 'add-user': userSheet(null); break;
-      case 'cancel-invite': S.invite = null; route(); break;
+      case 'history': if (s) showHistory(s); break;
       case 'gen-code': { const c = $('#u-code'); if (c) c.value = randomCode(); break; }
-      case 'copy-user-invite': {
-        const code = $('#u-code') ? $('#u-code').value.trim() : '';
-        const name = $('#u-name') ? $('#u-name').value.trim() : '';
-        const text = 'Shelter Surveys – ' + name + '\nOpen this link, install the app, and log in:\n' + inviteLink(code) + '\nYour personal code: ' + code + ' (keep it to yourself)';
-        if (!(await copyText(text))) { const m = $('#u-msg'); if (m) m.innerHTML = '<textarea readonly rows="5">' + esc(text) + '</textarea>'; }
-        break;
-      }
       case 'logout': {
         if (removeArm.get('logout') || !pendingCount()) { removeArm.delete('logout'); logout(); }
         else {
@@ -2977,7 +3038,7 @@
         break;
       }
       case 'sync-now': closeSheet(); S.sync.state = 'idle'; syncNow(); if (currentView === 'me') setTimeout(renderMe, 1500); break;
-      case 'copy-invite': copyText(inviteLink(''), $('#inviteText')); break;
+      case 'copy-invite': copyText(inviteLink(teamCodeForInvite()), $('#inviteText')); break;
       case 'reset': {
         if (removeArm.get('reset')) {
           await DB.clear();
@@ -3135,8 +3196,24 @@
     DB.put('surveys', s).catch(() => {});
   }
 
+  // When you upload new app files, each phone downloads them on its next open; then the app restarts itself
+  // into the new version (right away on the list, or when the person goes back to the list).
+  let updateReady = false, reloading = false;
+  function restartForUpdate() {
+    if (reloading) return;
+    reloading = true;
+    flushLocal();
+    setTimeout(() => location.reload(), 400);
+  }
   function registerSW() {
     if (CFG.demo || !('serviceWorker' in navigator) || location.protocol === 'file:') return;
+    const hadController = !!navigator.serviceWorker.controller;
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (!hadController) return; // first install, not an update
+      updateReady = true;
+      if (currentView === 'editor' || currentView === 'day') toast('A new version of the app is ready. It opens when you go back.', 4000);
+      else restartForUpdate();
+    });
     navigator.serviceWorker.register('sw.js').catch(() => { /* offline install not available */ });
   }
 
@@ -3154,6 +3231,7 @@
       S.tasks = (await DB.meta('tasks')) || [];
       S.leaders = (await DB.meta('leaders')) || [];
       S.users = (await DB.meta('users')) || [];
+      S.teamCode = (await DB.meta('teamCode')) || '';
       (await DB.all('surveys')).forEach((s) => { if (!s.isNew) S.surveys.set(s.id, s); });
     } catch (e) { /* start empty */ }
     readInvite();
@@ -3162,11 +3240,7 @@
       DB.setMeta('me', S.me).catch(() => {});
       if (!S.invite.code) { S.invite = null; toast('Connected to the team sheet'); }
     }
-    if (S.invite && S.invite.code && S.me && S.me.role && normCodeLocal(S.me.key) === normCodeLocal(S.invite.code)) S.invite = null; // already logged in with it
-    // Phones set up before personal codes (1.4 and older): log in once more with your own code. Surveys stay.
-    if (!CFG.demo && S.me && S.me.key && !S.me.role) {
-      S.needLogin = 'Shelter Surveys now gives everyone their own code. Ask an admin for yours. Surveys on this phone are kept and upload after you log in.';
-    }
+    if (S.invite && S.me && S.me.name && S.me.key) S.invite = null; // already logged in: the invite only fills the link
     if (CFG.demo && (!S.me || !S.me.role)) {
       S.me = { name: 'Begad (preview)', role: 'Admin', id: 'demo-admin', key: '', api: '', deviceId: uid() };
       DB.setMeta('me', S.me).catch(() => {});
@@ -3175,10 +3249,10 @@
     if (CFG.demo) {
       if (!S.leaders.length) S.leaders = [{ id: 'demo-tl', name: 'Tarek (example)' }];
       if (!S.users.length) S.users = [
-        { id: 'demo-admin', name: 'Begad (preview)', role: 'Admin', code: 'begd-1234', active: true },
-        { id: 'demo-tl', name: 'Tarek (example)', role: 'Team leader', code: 'trk7-5521', active: true },
-        { id: 'demo-rv', name: 'Ali (example)', role: 'Reviewer', code: 'alix-8830', active: true },
-        { id: 'demo-rs', name: 'Ahmed (example)', role: 'Researcher', code: 'ahm3-4410', active: true }
+        { id: 'demo-admin', name: 'Begad (preview)', role: 'Admin', code: 'begd-1234', personal: true, active: true, device: 'This device', lastSeen: nowIso() },
+        { id: 'demo-tl', name: 'Tarek (example)', role: 'Team leader', code: '', active: true, device: 'Android phone · Chrome', lastSeen: nowIso() },
+        { id: 'demo-rv', name: 'Ali (example)', role: 'Researcher', code: '', active: true, device: 'Windows PC · Edge', lastSeen: nowIso() },
+        { id: 'demo-rs', name: 'Ahmed (example)', role: 'Researcher', code: '', active: true, device: 'Android phone · Samsung Internet', lastSeen: nowIso() }
       ];
     }
     window.addEventListener('hashchange', route);

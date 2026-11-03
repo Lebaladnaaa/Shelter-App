@@ -1,7 +1,7 @@
 /* Shelter Surveys – keeps the app available without internet.
  * Change VERSION whenever you upload new app files, so phones fetch the update.
  */
-const VERSION = 'shelter-v1.5.0';
+const VERSION = 'shelter-v1.5.1';
 const SHELL = [
   './',
   './index.html',
@@ -31,11 +31,17 @@ self.addEventListener('install', (event) => {
 });
 
 self.addEventListener('activate', (event) => {
-  event.waitUntil(
-    caches.keys()
-      .then((keys) => Promise.all(keys.filter((k) => k !== VERSION).map((k) => caches.delete(k))))
-      .then(() => self.clients.claim())
-  );
+  event.waitUntil((async () => {
+    const keys = await caches.keys();
+    // versions before 1.5 can't restart themselves into an update: reopen them on the new version
+    const fromOld = keys.some((k) => /^shelter-v1\.[0-4]\./.test(k));
+    await Promise.all(keys.filter((k) => k !== VERSION).map((k) => caches.delete(k)));
+    await self.clients.claim();
+    if (fromOld) {
+      const wins = await self.clients.matchAll({ type: 'window' });
+      wins.forEach((c) => { if (c.navigate) c.navigate(c.url).catch(() => null); });
+    }
+  })());
 });
 
 self.addEventListener('fetch', (event) => {
