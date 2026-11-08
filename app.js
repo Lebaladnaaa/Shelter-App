@@ -13,7 +13,7 @@
     pptx: 'pptxgen.bundle.js',
     qr: 'qrcode.js'
   }, CFG.assets || {});
-  const APP_VERSION = '1.5.1';
+  const APP_VERSION = '1.6.1';
 
   const STATUSES = ['Draft', 'Submitted', 'Reviewed', 'Approved', 'Roofed', 'Cancelled'];
   const ROLES = ['Admin', 'Manager', 'Team leader', 'Researcher']; // researchers also review
@@ -309,6 +309,8 @@
   const isAdmin = () => role() === 'Admin';
   const isMgr = () => role() === 'Admin' || role() === 'Manager';
   const isLeader = () => role() === 'Team leader';
+  const isWaiting = () => role() === 'Waiting'; // joined with the team code, an admin has not let them in yet
+  const seesWood = () => isMgr() || isLeader(); // the purchase list is for managers and the teams that build
   const normName = (v) => String(v == null ? '' : v).replace(/\s+/g, ' ').trim().toLowerCase();
   function isOwner(s) {
     if (!S.me) return false;
@@ -321,24 +323,29 @@
   function canEdit(s) {
     if (!s || CFG.demo) return !!s;
     if (isMgr()) return true;
-    if (role() === 'Researcher') return !approved(s);
+    if (role() === 'Researcher' || isLeader()) return !approved(s);
     return false;
   }
   function canDelete(s) {
     if (CFG.demo || isMgr()) return true;
-    if (role() === 'Researcher') return isOwner(s) && !approved(s);
+    if (role() === 'Researcher' || isLeader()) return isOwner(s) && !approved(s);
     return false;
   }
-  const canAddPapers = (s) => canEdit(s) || (!isLeader() && isOwner(s));
+  const canAddPapers = (s) => canEdit(s) || isOwner(s);
   function whyReadOnly(s) {
-    if (isLeader()) return 'View only. Team leaders see the drawing and mark houses roofed.';
     if (s.status === 'Roofed') return 'View only. This house is roofed; only managers can change it.';
     return 'View only. It is approved, so only managers can change it now.';
   }
   const taskOf = (s) => S.tasks.find((t) => (t.surveyIds || []).indexOf(s.id) >= 0) || null;
   /** Google adds /u/0/, /u/1/… when several accounts are signed in; that form fails for everyone else. */
   const normCodeLocal = (v) => String(v == null ? '' : v).replace(/[\s\-_.]+/g, '').toLowerCase();
-  const cleanApi = (u) => String(u || '').trim().replace(/\/macros\/u\/\d+\/s\//, '/macros/s/');
+  /** Only a Google Apps Script web app link is accepted, so a fake invite link can't send surveys elsewhere. */
+  const cleanApi = (u) => {
+    const v = String(u || '').trim().replace(/\/macros\/u\/\d+\/s\//, '/macros/s/');
+    if (/^https:\/\/script\.google\.com\/macros\/s\/[A-Za-z0-9_-]{20,}\/exec\/?$/.test(v)) return v;
+    if (/^(localhost|127\.0\.0\.1)$/.test(location.hostname) && /^http:\/\/(localhost|127\.0\.0\.1):\d+\/?$/.test(v)) return v; // tests on this computer
+    return '';
+  };
   // config.js wins: change the link there once and every phone follows the next time it opens online
   const apiUrl = () => cleanApi(CFG.apiUrl || (S.me && S.me.api) || '');
   const curSurvey = () => (S.cur ? S.surveys.get(S.cur.id) : null);
@@ -383,7 +390,7 @@
     scheduleSync(300);
   }
   function pendingCount() {
-    let n = S.pendingDeletes.length + S.pendingStates.length + S.pendingTasks.length;
+    let n = S.pendingDeletes.length + S.pendingStates.length + S.pendingTasks.length + (S.pendingPhotos || []).length;
     S.surveys.forEach((s) => {
       if (s.isNew) return;
       if (s.dirty) n++;
@@ -443,12 +450,14 @@
     S.sync.state = 'busy';
     updateSyncPill();
     try {
-      if (!S.me.role || !S.me.id) await identify(); // phones from before 1.5: the sheet adds them by name
+      if (!S.me.role || !S.me.id || isWaiting()) await identify(); // first run, or waiting to be let in
+      if (isWaiting()) throw Object.assign(new Error('waiting'), { code: 'pending' });
       await pushDeletes();
       await pushSurveys();
       await pushPapers();
       await pushStates();
       await pushTasks();
+      await pushPhotos();
       await pull();
       S.sync = deleteProblem ? { state: 'error', msg: deleteProblem } : { state: 'ok', msg: '' };
       S.lastSyncAt = Date.now();
@@ -465,6 +474,12 @@
         await DB.setMeta('me', S.me);
         S.sync = { state: 'wait', msg: 'Logging in again…' };
         syncAgain = true;
+      }
+      else if (e.code === 'pending') { // still waiting for an admin
+        S.me = Object.assign({}, S.me, { role: 'Waiting' });
+        await DB.setMeta('me', S.me);
+        S.sync = { state: 'idle', msg: '' };
+        if (currentView !== 'waiting') setTimeout(route, 0);
       }
       else if (e.code === 'blocked') {
         S.sync = { state: 'badkey', msg: 'An admin switched off your access. Nothing on this phone is lost.' };
@@ -569,6 +584,7 @@
       ['researcher', 'createdById', 'reviewer', 'approvedBy'].forEach((k) => { if (res[k] != null) live[k] = res[k]; });
       live.locationCleared = false;
       if (res.status && res.status !== live.status) live.status = res.status;
+      if (res.needLocation) toast((live.family || 'A survey') + ': save the house location first. It stays a draft until then.', 5000);
       if (live.updatedAt === sentAt) live.dirty = false;
       await DB.put('surveys', live);
       refreshAfterSync(live, true);
@@ -697,7 +713,7 @@
     S.lastPull = res.serverTime || S.lastPull;
     await DB.setMeta('lastPull', S.lastPull);
     if (!S.cur && currentView === 'list') keepFocus(renderList);
-    if (!S.cur && (currentView === 'days' || currentView === 'users' || (currentView === 'day' && !isMgr()))) keepFocus(route);
+    if (!S.cur && (currentView === 'days' || currentView === 'users' || currentView === 'mine' || currentView === 'dash')) keepFocus(route);
     if (changedCurrent && currentView === 'editor') {
       const a = document.activeElement;
       if (!a || !/INPUT|TEXTAREA|SELECT/.test(a.tagName)) renderEditor(S.cur.id);
@@ -755,27 +771,64 @@
       location.replace('#');
       return;
     }
-    if (h.indexOf('day-') === 0 && (isMgr() || isLeader())) {
+    if (isWaiting()) { if (h === 'me') renderMe(); else renderWaiting(); return; }
+    if (h.indexOf('day-') === 0 && isMgr()) {
       const id = h.slice(4);
-      if (id === 'new' && isMgr()) { renderDay(null); return; }
+      if (id === 'new') { renderDay(null); return; }
       if (S.tasks.some((t) => t.id === id)) { renderDay(id); return; }
       location.replace('#days');
       return;
     }
-    if (h === 'days' && (isMgr() || isLeader())) { renderDays(); return; }
+    if (h === 'days' && isMgr()) { renderDays(); return; }
+    if (h === 'mine' && isLeader()) { renderMine(); return; }
+    if (h === 'dash') { renderDash(); return; }
     if (h === 'users' && isAdmin()) { renderUsers(); return; }
     if (h === 'rules') { renderRules(); return; }
     if (h === 'me') { renderMe(); return; }
-    if (isLeader()) { renderDays(); return; } // team leaders work from their implementation days
     renderList();
   }
 
-  /** Managers and admins switch between surveys, implementation days and users. */
+  /** Everyone: Surveys + Dashboard. Team leaders: + My houses. Managers: + Implementation days. Admins: + Users. */
   function navTabs(active) {
-    if (!isMgr()) return '';
-    const tabs = [['', 'Surveys'], ['days', 'Implementation days']].concat(isAdmin() ? [['users', 'Users']] : []);
+    if (isWaiting()) return '';
+    const waitingN = isAdmin() ? S.users.filter((u) => u.pending).length : 0;
+    const tabs = [['', 'Surveys']]
+      .concat(isLeader() ? [['mine', 'My houses']] : [])
+      .concat(isMgr() ? [['days', 'Implementation days']] : [])
+      .concat([['dash', 'Dashboard']])
+      .concat(isAdmin() ? [['users', 'Users' + (waitingN ? ' <span class="badge">' + waitingN + '</span>' : '')]] : []);
     return '<nav class="tabs" aria-label="Sections">' + tabs.map((t) =>
-      '<button class="tab" data-go="' + t[0] + '"' + (active === t[0] ? ' aria-current="page"' : '') + '>' + esc(t[1]) + '</button>').join('') + '</nav>';
+      '<button class="tab" data-go="' + t[0] + '"' + (active === t[0] ? ' aria-current="page"' : '') + '>' + (t[1].indexOf('<span') > 0 ? t[1] : esc(t[1])) + '</button>').join('') + '</nav>';
+  }
+
+  /** Joined with the team code: an admin lets them in. The app checks again by itself. */
+  let waitTimer = null;
+  function renderWaiting() {
+    currentView = 'waiting';
+    S.cur = null;
+    app().innerHTML = appbar({ eyebrow: 'Lebaladna · Shelter', title: 'Almost there', actions: '<button class="iconbtn" data-act="go-me" aria-label="Settings">' + ICON.gear + '</button>' }) +
+      '<main class="page"><div class="page-inner"><section class="panel waiting">' +
+      '<div class="wait-icon" aria-hidden="true">⏳</div>' +
+      '<h2 dir="auto">Hi ' + esc(S.me.name || '') + '!</h2>' +
+      '<p>An admin (Begad or Hawary) has to let you in before you can see the surveys. This protects the families\' information.</p>' +
+      '<p class="small muted">Tell them you joined. This screen opens the app by itself once they do.</p>' +
+      '<div class="btn-row"><button class="btn" data-act="check-again">Check now</button></div>' +
+      '</section></div></main>';
+    clearTimeout(waitTimer);
+    waitTimer = setTimeout(() => { if (currentView === 'waiting') checkAgain(true); }, 30000);
+  }
+  async function checkAgain(quiet) {
+    try {
+      const res = await api('ping', {}, 20000);
+      await applyConfig(res);
+      await applyMe(res);
+      await applyTeam(res);
+      if (!isWaiting()) { toast('You\'re in. Welcome!', 3000); S.lastPull = ''; scheduleSync(200); route(); return; }
+      if (!quiet) toast('Not yet. Ask Begad or Hawary to let you in.');
+    } catch (e) {
+      if (!quiet) toast(e.code === 'offline' ? 'No internet.' : e.message || 'Could not check');
+    }
+    if (currentView === 'waiting') renderWaiting();
   }
   const go = (hash) => { if (location.hash.replace('#', '') === hash) route(); else location.hash = hash; };
 
@@ -863,7 +916,7 @@
       S.invite = null;
       S.needLogin = '';
       S.sync = { state: 'idle', msg: '' };
-      toast('Welcome, ' + S.me.name + ' (' + S.me.role + ')');
+      toast(isWaiting() ? 'Welcome, ' + S.me.name + '!' : 'Welcome, ' + S.me.name + ' (' + S.me.role + ')');
       go('');
       scheduleSync(300);
     });
@@ -902,6 +955,7 @@
   function renderList() {
     currentView = 'list';
     S.cur = null;
+    S.backTo = '';
     S.surveys.forEach((s, id) => { if (s.isNew) S.surveys.delete(id); });
     const all = Array.from(S.surveys.values());
     const count = (fn) => all.filter(fn).length;
@@ -912,7 +966,7 @@
     ].concat(STATUSES.map((st) => [st, st, count((s) => s.status === st)]))
       .filter((c) => c[0] !== 'Cancelled' || c[2] > 0); // cancelling = deleting now; show only if old ones exist
     const items = filteredSurveys();
-    const sel = S.list.selecting && isMgr();
+    const sel = S.list.selecting;
     const hideInstall = lsGet('shelter-hide-install') === '1';
     const rulesNote = S.config.rules && S.config.rules.example
       ? '<div class="notice warn"><div><b>Wood rules are still the examples.</b> Set your team\'s rounding in the Google Sheet, tab “Wood rules”.</div><div class="btn-row"><button class="btn ghost sm" data-act="go-rules">See wood rules</button></div></div>' : '';
@@ -927,9 +981,10 @@
       (hideInstall ? '' : installHelp(true)) +
       (DB.memoryOnly ? '<div class="notice err"><b>This browser cannot keep surveys offline.</b> Install the app or use Chrome / Safari normally (not a private window).</div>' : '') +
       rulesNote +
-      (role() === 'Researcher' && count((s) => s.status === 'Submitted') ? '<div class="notice info small"><div><b>' + count((s) => s.status === 'Submitted') + ' submitted</b> waiting for review. <button class="linkbtn" data-filter="Submitted">Show them</button></div></div>' : '') +
+      (isAdmin() && S.users.some((u) => u.pending) ? '<div class="notice warn small"><div><b>' + S.users.filter((u) => u.pending).length + ' new people</b> are waiting for you to let them in. <button class="linkbtn" data-go="users">Open Users</button></div></div>' : '') +
+      ((role() === 'Researcher' || isLeader()) && count((s) => s.status === 'Submitted') ? '<div class="notice info small"><div><b>' + count((s) => s.status === 'Submitted') + ' submitted</b> waiting for review. <button class="linkbtn" data-filter="Submitted">Show them</button></div></div>' : '') +
       '<div class="search-row"><input type="search" id="q" dir="auto" placeholder="Search name, area, code, phone or ID" value="' + esc(S.list.q) + '" aria-label="Search surveys">' +
-      (isMgr() ? '<button class="btn ghost" data-act="toggle-select">' + (sel ? 'Done' : 'Select') + '</button>' : '') + '</div>' +
+      '<button class="btn ghost" data-act="toggle-select">' + (sel ? 'Done' : 'Select') + '</button></div>' +
       '<div class="chips" role="group" aria-label="Filter surveys">' + chips.map((c) =>
         '<button class="chip" data-filter="' + esc(c[0]) + '" aria-pressed="' + (S.list.filter === c[0]) + '">' + esc(c[1]) + ' <span class="count">' + c[2] + '</span></button>').join('') + '</div>' +
       '<div class="list" id="list">' + (items.length ? items.map(cardHtml).join('') : emptyHtml(all.length)) + '</div>' +
@@ -954,7 +1009,7 @@
     const waiting = s.dirty || pendingPapers;
     const n = (s.rooms || []).length;
     const bits = [s.area, s.code || 'not uploaded yet', n + (n === 1 ? ' room' : ' rooms') + ', ' + w.roofed + ' to roof'].filter(Boolean);
-    const woodLine = [w.beams && Object.keys(w.beams).length ? 'Beams ' + woodText(w.beams) : '', w.planks && Object.keys(w.planks).length ? 'Planks ' + woodText(w.planks) : ''].filter(Boolean).join(' · ');
+    const woodLine = !seesWood() ? '' : [w.beams && Object.keys(w.beams).length ? 'Beams ' + woodText(w.beams) : '', w.planks && Object.keys(w.planks).length ? 'Planks ' + woodText(w.planks) : ''].filter(Boolean).join(' · ');
     const picked = S.list.picked.has(s.id);
     return '<div class="card" role="button" tabindex="0" data-open="' + esc(s.id) + '">' +
       '<input type="checkbox" class="pick" data-pick="' + esc(s.id) + '"' + (picked ? ' checked' : '') + ' aria-label="Select this survey">' +
@@ -967,17 +1022,36 @@
       (hasLoc(s) ? '<span class="loctag" title="Location saved">' + ICON.pin + '</span>' : '') + '</div></div>';
   }
 
+  /** Ticked surveys: everyone can delete the ones they may delete; managers also get the purchase list and exports. */
   function selectionBar() {
     const picked = Array.from(S.list.picked).map((id) => S.surveys.get(id)).filter(Boolean);
+    const deletable = picked.filter(canDelete).length;
     const t = sumWood(picked);
     return '<div class="bottombar wide"><div class="bottombar-inner">' +
       '<div class="grow totals"><div><b>' + picked.length + '</b> selected</div>' +
-      (picked.length ? '<div>Beams <b>' + esc(woodText(t.beams) || '–') + '</b></div><div>Planks <b>' + esc(woodText(t.planks) || '–') + '</b></div>' : '<div class="muted">Tick houses to add up their wood</div>') +
+      (isMgr() ? (picked.length ? '<div>Beams <b>' + esc(woodText(t.beams) || '–') + '</b></div><div>Planks <b>' + esc(woodText(t.planks) || '–') + '</b></div>' : '<div class="muted">Tick houses to add up their wood</div>')
+        : (picked.length && deletable < picked.length ? '<div class="muted">' + (picked.length - deletable) + ' of them you can\'t delete</div>' : '<div class="muted">Tick surveys to delete them</div>')) +
       '</div><div class="btn-row">' +
       '<button class="btn ghost sm" data-act="pick-all">Select shown</button>' +
-      '<button class="btn sm" data-act="export-picked" data-kind="pdf"' + (picked.length ? '' : ' disabled') + '>PDF</button>' +
-      '<button class="btn sm" data-act="export-picked" data-kind="pptx"' + (picked.length ? '' : ' disabled') + '>PowerPoint</button>' +
+      (isMgr() ? '<button class="btn sm" data-act="export-picked" data-kind="pdf"' + (picked.length ? '' : ' disabled') + '>PDF</button>' +
+        '<button class="btn sm" data-act="export-picked" data-kind="pptx"' + (picked.length ? '' : ' disabled') + '>PowerPoint</button>' : '') +
+      '<button class="btn danger sm" data-act="delete-picked"' + (deletable ? '' : ' disabled') + '>Delete' + (deletable ? ' ' + deletable : '') + '</button>' +
       '</div></div></div>';
+  }
+
+  /** Delete several surveys from the list (only those this person may delete). */
+  async function deletePicked() {
+    const list = Array.from(S.list.picked).map((id) => S.surveys.get(id)).filter((s) => s && canDelete(s));
+    for (const s of list) {
+      if (!s.isNew && !S.pendingDeletes.some((d) => d.id === s.id)) S.pendingDeletes.push({ id: s.id, code: s.code || '', family: s.family || '' });
+      await removeLocal(s.id);
+    }
+    await DB.setMeta('pendingDeletes', S.pendingDeletes).catch(() => {});
+    S.list.picked.clear();
+    S.list.selecting = false;
+    toast('Deleted ' + list.length + (list.length === 1 ? ' survey' : ' surveys'));
+    renderList();
+    scheduleSync(300);
   }
 
   function newSurvey() {
@@ -993,8 +1067,9 @@
   }
 
   /* ── Survey editor ───────────────────────── */
-  /** Team leaders don't get the Papers step (ID photos stay with the researchers and managers). */
-  const stepsFor = () => (isLeader() ? [0, 1, 2, 4] : [0, 1, 2, 3, 4]);
+  /** Every role gets all five steps; researchers' last step is a checklist instead of the wood list. */
+  const stepsFor = () => [0, 1, 2, 3, 4];
+  const stepLabel = (i) => (i === 4 && !seesWood() ? 'Check & submit' : STEPS[i].label);
 
   function renderEditor(id) {
     currentView = 'editor';
@@ -1007,7 +1082,7 @@
     const pos = order.indexOf(step);
     const ro = !canEdit(s);
     const steps = order.map((i, n) =>
-      '<button class="step' + (n < pos ? ' done' : '') + '" data-step="' + i + '"' + (i === step ? ' aria-current="step"' : '') + ' aria-label="Step ' + (n + 1) + ': ' + esc(STEPS[i].label) + '"><span class="n">' + (n + 1) + '</span><span class="lbl">' + esc(STEPS[i].label) + '</span></button>').join('');
+      '<button class="step' + (n < pos ? ' done' : '') + '" data-step="' + i + '"' + (i === step ? ' aria-current="step"' : '') + ' aria-label="Step ' + (n + 1) + ': ' + esc(stepLabel(i)) + '"><span class="n">' + (n + 1) + '</span><span class="lbl">' + esc(stepLabel(i)) + '</span></button>').join('');
     let body = '';
     if (step === 0) body = familyStep(s, ro);
     else if (step === 1) body = roomsStep(s, ro);
@@ -1016,7 +1091,7 @@
     else body = woodStep(s);
     const next = order[pos + 1] != null ? order[pos + 1] : null;
     const prev = pos > 0 ? order[pos - 1] : null;
-    const backLabel = S.backTo && S.backTo.indexOf('day-') === 0 ? 'Day' : 'Surveys';
+    const backLabel = S.backTo === 'mine' ? 'My houses' : S.backTo === 'dash' ? 'Dashboard' : S.backTo && S.backTo.indexOf('day-') === 0 ? 'Day' : 'Surveys';
     app().innerHTML = appbar({ back: true, eyebrow: s.code || 'Not uploaded yet', title: s.family || 'New survey' }) +
       '<main class="page"><div class="page-inner">' +
       '<nav class="steps" aria-label="Survey steps">' + steps + '</nav>' +
@@ -1026,7 +1101,9 @@
       '<div class="bottombar"><div class="bottombar-inner">' +
       (prev != null ? '<button class="btn ghost" data-step="' + prev + '">Back</button>' : '<button class="btn ghost" data-act="back">' + backLabel + '</button>') +
       '<span class="grow"></span>' +
-      (next != null ? '<button class="btn" data-step="' + next + '">Next: ' + esc(STEPS[next].label) + '</button>' : '<button class="btn leaf" data-act="back">Done</button>') +
+      (next != null ? '<button class="btn" data-step="' + next + '">Next: ' + esc(stepLabel(next)) + '</button>'
+        : (s.status || 'Draft') === 'Draft' && canEdit(s) && !isMgr() ? '<button class="btn leaf big-submit" data-act="submit-survey">' + ICON.check + 'Submit for review</button>'
+          : '<button class="btn leaf" data-act="back">Done</button>') +
       '</div></div>';
     if (step === 0) updateDupWarn(s);
     if (step === 2) setupPlan();
@@ -1092,19 +1169,20 @@
       if (st === 'Cancelled') out.push(b('Draft', 'Restore'));
       out.push('<label class="status-pick"><span class="small muted">Status</span><select data-statuspick aria-label="Set status">' +
         STATUSES.map((x) => '<option' + (x === st ? ' selected' : '') + '>' + x + '</option>').join('') + '</select></label>');
-    } else if (role() === 'Researcher') { // records and reviews
+    } else if (role() === 'Researcher' || isLeader()) { // records and reviews
       if (st === 'Draft') out.push(b('Submitted', 'Submit for review', 'leaf'), b('Reviewed', 'Mark reviewed'));
       if (st === 'Submitted') out.push(b('Reviewed', 'Mark reviewed', 'leaf'), b('Draft', 'Back to draft'));
       if (st === 'Reviewed') out.push(b('Submitted', 'Undo review'));
-    } else if (isLeader() && taskOf(s)) {
-      if (st === 'Roofed') out.push(b('Pending', 'Mark pending'));
-      else out.push(b('Roofed', 'Mark roofed', 'leaf'));
+      if (isLeader() && isMyHouse(s)) {
+        if (st === 'Roofed') out.push(b('Pending', 'Mark pending'));
+        else if (st === 'Approved') out.push(b('Roofed', 'Mark roofed', 'leaf'));
+      }
     }
     return out.join('');
   }
 
   function statusPanel(s, full) {
-    const hist = full && !isLeader() && s.base ? '<button class="btn quiet sm" data-act="history">History</button>' : '';
+    const hist = full && isMgr() && s.base ? '<button class="btn quiet sm" data-act="history">History (who changed what)</button>' : '';
     const acts = statusActions(s);
     const missingPapers = full && !isLeader() ? paperTypes(s).filter((t) => t.required && !(s.papers || []).some((p) => p.paper === t.name)) : [];
     const waitingMark = S.pendingStates.some((x) => x.surveyId === s.id);
@@ -1127,16 +1205,16 @@
     if (L) {
       inner = '<div class="loc"><div class="loc-coords"><b class="data">' + fix6(L.lat) + ', ' + fix6(L.lng) + '</b>' +
         '<span class="small muted">' + (L.acc ? 'accurate to ± ' + Math.round(L.acc) + ' m · ' : '') + 'saved ' + esc(fmtWhen(L.at)) + '</span></div>' +
-        '<div class="btn-row"><a class="btn sm" href="' + navLink(L) + '" target="_blank" rel="noopener">' + ICON.pin + 'Navigate</a>' +
-        '<a class="btn ghost sm" href="' + mapsLink(L) + '" target="_blank" rel="noopener">Open in Maps</a>' +
-        (ro ? '' : '<button class="btn quiet sm" data-act="gps">Save again</button><button class="btn quiet sm" data-act="gps-clear">Remove</button>') + '</div></div>';
+        '<div class="btn-row"><a class="btn sm" href="' + navLink(L) + '" target="_blank" rel="noopener noreferrer">' + ICON.pin + 'Navigate</a>' +
+        '<a class="btn ghost sm" href="' + mapsLink(L) + '" target="_blank" rel="noopener noreferrer">Open in Maps</a>' +
+        (ro ? '' : '<button class="btn quiet sm" data-act="gps">Save again</button>' + ((s.status || 'Draft') === 'Draft' ? '<button class="btn quiet sm" data-act="gps-clear">Remove</button>' : '')) + '</div></div>';
     } else if (ro) {
       inner = '<p class="small muted" style="margin:0">No location saved for this house.</p>';
     } else {
-      inner = '<p class="small muted" style="margin:0">At the house door, tap the button. The team finds the house with it on implementation day, and it prints as a QR code on the PDF.</p>' +
+      inner = '<p class="small muted" style="margin:0"><b>Required.</b> At the house door, tap the button. The team finds the house with it on implementation day, and it prints as a QR code on the PDF.</p>' +
         '<div class="btn-row"><button class="btn ghost" data-act="gps">' + ICON.pin + 'Save house location</button></div>';
     }
-    return '<section class="panel" id="locPanel"><div class="panel-head"><h2>House location</h2></div>' + inner + '<div id="gpsMsg"></div></section>';
+    return '<section class="panel" id="locPanel"><div class="panel-head"><h2>House location' + (L ? '' : ' <span class="req">required</span>') + '</h2></div>' + inner + '<div id="gpsMsg"></div></section>';
   }
 
   let gpsWatch = null;
@@ -1628,6 +1706,7 @@
       if (CFG.demo || !apiUrl()) { showSheet('<h2>Not on this device</h2><p class="muted">This paper is only on the phone that took it.</p><div class="btn-row"><button class="btn" data-act="close-sheet">Close</button></div>'); return; }
       try {
         const res = await api('getFile', { fileId: pid }, 90000);
+        if (!/^(image\/(jpeg|png|webp)|application\/pdf)$/.test(res.mime || '')) throw new Error('This file is not a photo or PDF.');
         const blob = b64ToBlob(res.data, res.mime);
         rec = { id: pid, blob, mime: res.mime, cached: true };
         DB.put('files', rec).catch(() => {});
@@ -1709,6 +1788,7 @@
   }
 
   function woodStep(s) {
+    if (!seesWood()) return summaryStep(s);
     const w = calcWood(s.rooms, S.config.rules);
     const rules = normRules(S.config.rules);
     const totalBox = (title, map) => '<div class="total"><h3>' + title + '</h3>' +
@@ -1727,6 +1807,32 @@
       statusPanel(s, true) +
       (canDelete(s) && !s.isNew ? '<section class="panel"><div class="panel-head"><h2>Delete</h2></div>' +
         '<p class="small muted" style="margin:0">Removes the survey from the sheet and from every phone. Its photos go to the Google Drive trash, and the sheet keeps a copy in the “Deleted” tab.</p>' +
+        '<div class="btn-row"><button class="btn danger" data-act="delete-survey">Delete survey</button></div></section>' : '');
+  }
+
+  /** Researchers' last step: what's ready and what's missing, no wood list. */
+  function summaryStep(s) {
+    const w = calcWood(s.rooms, S.config.rules);
+    const noSize = (s.rooms || []).filter((r) => r.roof && !(toNum(r.beamSide) > 0 && toNum(r.plankSide) > 0)).map((r) => r.name || 'Room');
+    const miss = [];
+    if (!String(s.family || '').trim()) miss.push('Head of family');
+    if (!(s.rooms || []).length) miss.push('Rooms');
+    if (noSize.length) miss.push('Sizes for ' + noSize.join(', '));
+    if (!hasLoc(s)) miss.push('House location');
+    return '<section class="panel"><div class="panel-head"><h2>Check before submitting</h2></div>' +
+      '<ul class="checklist">' +
+      '<li class="' + (String(s.family || '').trim() ? 'ok' : 'no') + '">Family: <bdi>' + esc(s.family || '—') + '</bdi></li>' +
+      '<li class="' + ((s.rooms || []).length ? 'ok' : 'no') + '">' + (s.rooms || []).length + ' rooms, ' + w.roofed + ' to roof · ' + fmtM(w.roofArea) + ' m²</li>' +
+      '<li class="' + (noSize.length ? 'no' : 'ok') + '">' + (noSize.length ? 'Missing sizes: ' + esc(noSize.join(', ')) : 'All roof sizes measured') + '</li>' +
+      '<li class="' + (hasLoc(s) ? 'ok' : 'no') + '">' + (hasLoc(s) ? 'Location saved' : 'House location missing (required, step 1)') + '</li>' +
+      '<li class="' + ((s.papers || []).length ? 'ok' : 'opt') + '">' + (s.papers || []).length + ' paper photo(s)</li>' +
+      '</ul>' +
+      (w.warnings.length ? '<div class="notice err small"><div>' + w.warnings.map(esc).join('<br>') + '</div></div>' : '') +
+      '</section>' +
+      '<section class="panel"><div class="panel-head"><h2>Drawing</h2></div><div class="btn-row"><button class="btn ghost" data-act="export" data-kind="png">' + ICON.download + 'Save drawing image</button></div></section>' +
+      statusPanel(s, true) +
+      (canDelete(s) && !s.isNew ? '<section class="panel"><div class="panel-head"><h2>Delete</h2></div>' +
+        '<p class="small muted" style="margin:0">Removes the survey from the sheet and from every phone. The sheet keeps a copy in the “Deleted” tab.</p>' +
         '<div class="btn-row"><button class="btn danger" data-act="delete-survey">Delete survey</button></div></section>' : '');
   }
 
@@ -1880,42 +1986,354 @@
 
   function renderDay(id) {
     S.backTo = 'day-' + (id || 'new');
-    if (isMgr()) renderDayEdit(id); else renderDayView(id);
+    renderDayEdit(id);
   }
 
-  /** Team leaders: the houses of one day, with the drawing, the way there, and Roofed / Pending. */
-  function renderDayView(id) {
-    currentView = 'day';
+  /* ── Team leaders: My houses ───────────────────────── */
+  const houseLeaderOf = (t, sid) => (t.houseLeaders && t.houseLeaders[sid]) || t.leaderId || '';
+  /** A house this team leader builds: assigned to them, or in their day without its own leader. */
+  function isMyHouse(s) {
+    if (!S.me || !s) return false;
+    const t = taskOf(s);
+    if (t) { const lid = houseLeaderOf(t, s.id); return lid ? lid === S.me.id : isLeader(); }
+    return !!s.leaderId && s.leaderId === S.me.id;
+  }
+  function myDays() {
+    return S.tasks.map((t) => ({ t, houses: (t.surveyIds || []).map((id) => S.surveys.get(id)).filter((s) => s && isMyHouse(s)) }))
+      .filter((x) => x.houses.length)
+      .sort((a, b) => String(a.t.date || '9').localeCompare(String(b.t.date || '9')));
+  }
+
+  function houseRow(s) {
+    const w = calcWood(s.rooms, S.config.rules);
+    const isRoofed = s.status === 'Roofed';
+    const waiting = S.pendingStates.some((x) => x.surveyId === s.id);
+    const hasPhoto = (S.photos || []).some((p) => p.kind === 'roof' && p.surveyId === s.id);
+    return '<div class="house' + (isRoofed ? ' roofed' : '') + '"><div class="house-main"><div class="fam" dir="auto">' + esc(s.family || 'No name') + '</div>' +
+      '<div class="sub">' + [s.code, s.area, s.mobile, w.roofed + (w.roofed === 1 ? ' room' : ' rooms') + ' to roof'].filter(Boolean).map((x) => '<bdi>' + esc(x) + '</bdi>').join(' · ') + '</div>' +
+      '<div class="sub"><span class="status ' + (isRoofed ? 'st-Roofed' : 'st-Approved') + '">' + (isRoofed ? 'Roofed' : 'Pending') + '</span>' + (waiting ? ' <span class="cloud">Not uploaded</span>' : '') + '</div></div>' +
+      '<div class="btn-row">' +
+      '<button class="btn ghost sm" data-openhouse="' + esc(s.id) + '">Drawing</button>' +
+      (hasLoc(s) ? '<a class="btn ghost sm" href="' + navLink(s.location) + '" target="_blank" rel="noopener noreferrer">' + ICON.pin + 'Navigate</a>' : '<span class="small muted nolocation">No location</span>') +
+      (isRoofed ? (hasPhoto ? '' : '<button class="btn ghost sm" data-snap="roof" data-sid="' + esc(s.id) + '">📸 Roof photo</button>') + '<button class="btn quiet sm" data-mark="' + esc(s.id) + '" data-state="Pending">Mark pending</button>'
+        : '<button class="btn leaf sm" data-mark="' + esc(s.id) + '" data-state="Roofed">' + ICON.check + 'Roofed</button>') +
+      '</div></div>';
+  }
+
+  function renderMine() {
+    currentView = 'mine';
     S.cur = null;
-    const t = S.tasks.find((x) => x.id === id);
-    const hs = taskSurveys(t);
-    const n = (t.surveyIds || []).length;
-    const roofed = hs.filter((s) => s.status === 'Roofed').length;
-    const missing = n - hs.length;
-    const rows = hs.map((s) => {
-      const w = calcWood(s.rooms, S.config.rules);
-      const isRoofed = s.status === 'Roofed';
-      const waiting = S.pendingStates.some((x) => x.surveyId === s.id);
-      return '<div class="house' + (isRoofed ? ' roofed' : '') + '"><div class="house-main"><div class="fam" dir="auto">' + esc(s.family || 'No name') + '</div>' +
-        '<div class="sub">' + [s.code, s.area, s.mobile, w.roofed + (w.roofed === 1 ? ' room' : ' rooms') + ' to roof'].filter(Boolean).map((x) => '<bdi>' + esc(x) + '</bdi>').join(' · ') + '</div>' +
-        '<div class="sub"><span class="status ' + (isRoofed ? 'st-Roofed' : 'st-Approved') + '">' + (isRoofed ? 'Roofed' : 'Pending') + '</span>' + (waiting ? ' <span class="cloud">Not uploaded</span>' : '') + '</div></div>' +
-        '<div class="btn-row">' +
-        '<button class="btn ghost sm" data-openhouse="' + esc(s.id) + '">Drawing</button>' +
-        (hasLoc(s) ? '<a class="btn ghost sm" href="' + navLink(s.location) + '" target="_blank" rel="noopener">' + ICON.pin + 'Navigate</a>' : '<span class="small muted nolocation">No location</span>') +
-        (isRoofed ? '<button class="btn quiet sm" data-mark="' + esc(s.id) + '" data-state="Pending">Mark pending</button>'
-          : '<button class="btn leaf sm" data-mark="' + esc(s.id) + '" data-state="Roofed">' + ICON.check + 'Roofed</button>') +
-        '</div></div>';
-    }).join('');
-    app().innerHTML = appbar({ back: true, backAct: 'go-days', eyebrow: 'Implementation day · ' + fmtDay(t.date), title: t.name }) +
-      '<main class="page"><div class="page-inner">' +
-      '<section class="panel"><div class="panel-head"><h2>' + roofed + ' of ' + n + ' roofed</h2><span class="small muted"><bdi>' + esc(leaderNameOf(t)) + '</bdi></span></div>' +
-      '<div class="progress big"><i style="width:' + (n ? Math.round(roofed / n * 100) : 0) + '%"></i></div>' +
-      '<p class="small muted" style="margin:0">Marks work without internet; they upload when you are back online.</p></section>' +
-      (missing > 0 ? '<div class="notice warn small"><div>' + missing + ' house(s) of this day are not on this phone yet. Open the app with internet to download them.</div></div>' : '') +
-      '<div class="houses">' + (rows || '<p class="muted">No houses in this day yet.</p>') + '</div>' +
-      (hs.length ? '<section class="panel"><div class="panel-head"><h2>Print / share</h2></div><p class="small muted" style="margin:0">One page per house with the drawing, room sizes and wood for each room.</p>' +
-        '<div class="btn-row"><button class="btn" data-act="export-day" data-kind="pdf">' + ICON.file + 'PDF</button><button class="btn ghost" data-act="export-day" data-kind="pptx">' + ICON.file + 'PowerPoint</button></div></section>' : '') +
+    S.backTo = 'mine';
+    const days = myDays();
+    const all = days.reduce((a, x) => a.concat(x.houses), []);
+    const roofed = all.filter((s) => s.status === 'Roofed').length;
+    app().innerHTML = appbar({
+      eyebrow: 'Lebaladna · Shelter · ' + (S.me.name || '') + ' (Team leader)', title: 'My houses', wide: true,
+      actions: '<button class="iconbtn" data-act="go-rules" aria-label="Wood rules">' + ICON.wood + '</button><button class="iconbtn" data-act="go-me" aria-label="Settings">' + ICON.gear + '</button>'
+    }) +
+      '<main class="page wide"><div class="page-inner">' + navTabs('mine') +
+      (all.length ? '<section class="panel"><div class="panel-head"><h2>' + roofed + ' of ' + all.length + ' roofed</h2>' +
+        '<button class="btn ghost sm" data-snap="team">📷 Team picture</button></div>' +
+        '<div class="progress big"><i style="width:' + Math.round(roofed / all.length * 100) + '%"></i></div>' +
+        '<p class="small muted" style="margin:0">Marks work without internet; they upload when you are back online.</p></section>' : '') +
+      (days.length ? days.map((x) => {
+        const done = x.houses.filter((s) => s.status === 'Roofed').length;
+        return '<h2 class="list-title">' + ICON.calendar + '<bdi>' + esc(x.t.name) + '</bdi> <span class="muted small">' + esc(fmtDay(x.t.date)) + ' · ' + done + '/' + x.houses.length + '</span></h2>' +
+          '<div class="houses">' + x.houses.map(houseRow).join('') + '</div>' +
+          '<div class="btn-row"><button class="btn ghost sm" data-act="export-mine" data-task="' + esc(x.t.id) + '" data-kind="pdf">' + ICON.file + 'PDF of these houses</button>' +
+          '<button class="btn ghost sm" data-act="export-mine" data-task="' + esc(x.t.id) + '" data-kind="pptx">' + ICON.file + 'PowerPoint</button></div>';
+      }).join('')
+        : '<div class="empty"><h2>No houses for you yet</h2><p>When a manager puts houses on an implementation day for you, they appear here with their drawings and the way there. Open the app with internet to get them.</p></div>') +
       '</div></main>';
+  }
+
+  /* ── Dashboard (everyone) ───────────────────────── */
+  const MONTHS = (iso) => String(iso || '').slice(0, 7);
+  function teamNames() {
+    const n = {};
+    (S.leaders || []).forEach((l) => { n[l.id] = l.name; });
+    S.surveys.forEach((s) => { if (s.leaderId && s.leaderName) n[s.leaderId] = s.leaderName; });
+    (S.photos || []).forEach((p) => { if (p.teamId && p.team) n[p.teamId] = p.team; });
+    return n;
+  }
+  function streak(dates) { // days in a row, ending today or yesterday
+    const set = new Set(dates.map((d) => d.slice(0, 10)));
+    let n = 0;
+    const d = new Date();
+    if (!set.has(d.toISOString().slice(0, 10))) d.setDate(d.getDate() - 1);
+    while (set.has(d.toISOString().slice(0, 10))) { n++; d.setDate(d.getDate() - 1); }
+    return n;
+  }
+  function avatar(name, photo, cls) {
+    if (photo && photo.image) return '<img class="avatar ' + (cls || '') + '" src="data:image/jpeg;base64,' + photo.image + '" alt="">';
+    const ini = String(name || '?').trim().split(/\s+/).map((w) => w[0]).join('').slice(0, 2).toUpperCase();
+    return '<span class="avatar ini ' + (cls || '') + '" aria-hidden="true">' + esc(ini) + '</span>';
+  }
+
+  function renderDash() {
+    currentView = 'dash';
+    S.cur = null;
+    S.backTo = 'dash';
+    if (!S.dash) S.dash = { period: 'month' };
+    const month = MONTHS(nowIso());
+    const inPeriod = (iso) => S.dash.period === 'all' || MONTHS(iso) === month;
+    const all = Array.from(S.surveys.values()).filter((s) => !s.isNew);
+    const roofed = all.filter((s) => s.status === 'Roofed');
+    const roofTime = (s) => s.roofedAt || s.updatedAt || '';
+    const names = teamNames();
+    const teamPhoto = {};
+    (S.photos || []).forEach((p) => { if (p.kind === 'team' && p.teamId) teamPhoto[p.teamId] = p; });
+
+    // teams: houses roofed under each team leader
+    const teams = {};
+    roofed.forEach((s) => {
+      const tid = s.teamId || s.leaderId || '';
+      if (!tid || !inPeriod(roofTime(s))) return;
+      (teams[tid] = teams[tid] || { id: tid, n: 0, dates: [] }).n++;
+      teams[tid].dates.push(roofTime(s));
+    });
+    (S.leaders || []).forEach((l) => { if (!teams[l.id]) teams[l.id] = { id: l.id, n: 0, dates: [] }; });
+    const teamList = Object.values(teams).sort((a, b) => b.n - a.n || String(names[a.id] || '').localeCompare(String(names[b.id] || '')));
+    const maxT = Math.max(1, ...teamList.map((x) => x.n));
+    const medal = (i, n) => (n ? ['🥇', '🥈', '🥉'][i] || '' : '');
+
+    // researchers: surveys made and reviewed
+    const people = {};
+    const bump = (name, key) => { if (!name) return; (people[name] = people[name] || { name, made: 0, reviewed: 0 })[key]++; };
+    all.forEach((s) => {
+      if (inPeriod(s.createdAt)) bump(s.researcher, 'made');
+      if (s.reviewer && inPeriod(s.updatedAt)) bump(s.reviewer, 'reviewed');
+    });
+    const peopleList = Object.values(people).sort((a, b) => (b.made + b.reviewed) - (a.made + a.reviewed)).slice(0, 10);
+
+    const week = new Date(Date.now() - 7 * 864e5).toISOString();
+    const stats = [
+      [roofed.filter((s) => MONTHS(roofTime(s)) === month).length, 'roofed this month'],
+      [roofed.length, 'roofed in total'],
+      [all.filter((s) => s.status === 'Approved').length, 'approved, waiting'],
+      [all.filter((s) => (s.createdAt || '') >= week).length, 'surveys this week']
+    ];
+    const stories = (S.photos || []).filter((p) => p.kind === 'story').sort((a, b) => (a.time < b.time ? 1 : -1));
+    const byAuthor = [];
+    stories.forEach((p) => { let g = byAuthor.find((x) => x.byId === p.byId); if (!g) byAuthor.push(g = { byId: p.byId, by: p.by, teamId: p.teamId, list: [] }); g.list.push(p); });
+    const roofs = (S.photos || []).filter((p) => p.kind === 'roof').sort((a, b) => (a.time < b.time ? 1 : -1)).slice(0, 12);
+
+    app().innerHTML = appbar({
+      eyebrow: 'Lebaladna · Shelter · ' + (S.me.name || '') + ' (' + role() + ')', title: 'Dashboard', wide: true,
+      actions: '<button class="iconbtn" data-act="go-me" aria-label="Settings">' + ICON.gear + '</button>'
+    }) +
+      '<main class="page wide"><div class="page-inner dash">' + navTabs('dash') +
+      // stories, Snapchat style
+      '<div class="stories" role="list" aria-label="Stories">' +
+      '<button class="story-ring add" data-snap="story" role="listitem"><span class="ring">' + avatar(S.me.name, isLeader() ? teamPhoto[S.me.id] : null) + '<span class="plus">+</span></span><span class="who">Your story</span></button>' +
+      byAuthor.map((g, i) => '<button class="story-ring" data-story="' + i + '" role="listitem"><span class="ring on">' + avatar(g.by, teamPhoto[g.teamId]) + '</span><span class="who" dir="auto">' + esc(g.by) + '</span></button>').join('') +
+      '</div>' +
+      (S.photoMsg ? '<div class="notice warn small"><div>' + esc(S.photoMsg) + '</div></div>' : '') +
+      '<div class="stat-row">' + stats.map((x) => '<div class="stat"><b>' + x[0] + '</b><span>' + esc(x[1]) + '</span></div>').join('') + '</div>' +
+      '<div class="chips" role="group" aria-label="Period"><button class="chip" data-period="month" aria-pressed="' + (S.dash.period === 'month') + '">This month</button><button class="chip" data-period="all" aria-pressed="' + (S.dash.period === 'all') + '">All time</button></div>' +
+      '<div class="dash-grid">' +
+      '<section class="panel"><div class="panel-head"><h2>🏆 Teams</h2><span class="small muted">houses roofed</span></div>' +
+      (teamList.length ? '<ol class="rank">' + teamList.map((x, i) => {
+        const st = streak(x.dates);
+        return '<li class="' + (x.id === S.me.id ? 'me' : '') + '"><span class="pos">' + (medal(i, x.n) || (i + 1)) + '</span>' + avatar(names[x.id], teamPhoto[x.id]) +
+          '<span class="r-main"><b dir="auto">' + esc(names[x.id] || 'Team') + '</b><span class="bar"><i style="width:' + Math.round(x.n / maxT * 100) + '%"></i></span>' +
+          (st > 1 ? '<span class="streak">🔥 ' + st + ' days in a row</span>' : '') + '</span><span class="r-n">' + x.n + '</span></li>';
+      }).join('') + '</ol>' : '<p class="muted">No team leaders yet.</p>') + '</section>' +
+      '<section class="panel"><div class="panel-head"><h2>🔎 Researchers</h2><span class="small muted">surveys · reviews</span></div>' +
+      (peopleList.length ? '<ol class="rank">' + peopleList.map((x, i) => '<li class="' + (normName(x.name) === normName(S.me.name) ? 'me' : '') + '"><span class="pos">' + (medal(i, 1) || (i + 1)) + '</span>' + avatar(x.name) +
+        '<span class="r-main"><b dir="auto">' + esc(x.name) + '</b><span class="small muted">' + x.made + ' surveyed · ' + x.reviewed + ' reviewed</span></span><span class="r-n">' + (x.made + x.reviewed) + '</span></li>').join('') + '</ol>'
+        : '<p class="muted">No surveys in this period yet.</p>') + '</section>' +
+      '</div>' +
+      recentPanel() +
+      '<section class="panel"><div class="panel-head"><h2>🏠 Latest roofs</h2>' + (isLeader() ? '<button class="btn ghost sm" data-snap="team">📷 Team picture</button>' : '') + '</div>' +
+      (roofs.length ? '<div class="roof-grid">' + roofs.map((p, i) => '<button class="roof-tile" data-roofphoto="' + i + '"><img src="data:image/jpeg;base64,' + (p.image || '') + '" alt="Roof photo ' + esc(p.code) + '" loading="lazy"><span><b>' + esc(p.code || '') + '</b> ' + esc(p.team || p.by || '') + '</span></button>').join('') + '</div>'
+        : '<p class="muted">Roof photos appear here when team leaders mark houses roofed and snap a picture.</p>') + '</section>' +
+      '</div></main>';
+    if (!S.photosLoadedAt || Date.now() - S.photosLoadedAt > 60000) {
+      Promise.all([refreshPhotos(), loadRecent()]).then((r) => { if ((r[0] || r[1]) && currentView === 'dash') renderDash(); });
+    }
+  }
+
+  /* ── Photos: small JPEGs kept in the sheet ───────────────────────── */
+  async function loadPhotos() { S.photos = (await DB.meta('photos')) || []; S.pendingPhotos = (await DB.meta('pendingPhotos')) || []; }
+  async function refreshPhotos() {
+    if (CFG.demo || !apiUrl() || isWaiting()) return false;
+    try {
+      const res = await api('photos', { have: (S.photos || []).filter((p) => p.image).map((p) => p.id) }, 60000);
+      const old = new Map((S.photos || []).map((p) => [p.id, p]));
+      const next = (res.photos || []).map((p) => Object.assign({}, p, { image: p.image || (old.get(p.id) || {}).image || '' }));
+      const changed = next.length !== old.size || next.some((p) => !old.has(p.id));
+      S.photos = next;
+      S.photosLoadedAt = Date.now();
+      S.photoMsg = '';
+      await DB.setMeta('photos', S.photos);
+      return changed;
+    } catch (e) {
+      S.photoMsg = e.code === 'offline' ? 'Offline: showing the photos saved on this phone.' : '';
+      S.photosLoadedAt = Date.now();
+      return false;
+    }
+  }
+  async function pushPhotos() {
+    while (S.pendingPhotos && S.pendingPhotos.length) {
+      const p = S.pendingPhotos[0];
+      try {
+        const res = await api('addPhoto', { kind: p.kind, surveyId: p.surveyId || '', image: p.image, caption: p.caption || '' }, 60000);
+        S.photos = (S.photos || []).filter((x) => !(x.local && x.id === p.localId) && !(p.kind === 'roof' && x.kind === 'roof' && x.surveyId === p.surveyId) && !(p.kind === 'team' && x.kind === 'team' && x.teamId === res.photo.teamId)).concat([res.photo]);
+        await DB.setMeta('photos', S.photos);
+      } catch (e) {
+        if (e.code === 'offline' || e.code === 'busy' || e.code === 'timeout') throw e;
+        toast('Photo not saved: ' + (e.message || e.code), 4000); // refused (too big, not allowed…): drop it
+        S.photos = (S.photos || []).filter((x) => !(x.local && x.id === p.localId));
+      }
+      S.pendingPhotos.shift();
+      await DB.setMeta('pendingPhotos', S.pendingPhotos);
+    }
+  }
+
+  /** Shrink to fit one sheet cell (~35 KB): smaller and softer until it fits. */
+  function fitJpeg(canvas) {
+    let c = canvas, q = 0.72, data = '';
+    for (let i = 0; i < 12; i++) {
+      data = c.toDataURL('image/jpeg', q).split(',')[1] || '';
+      if (data.length <= 44000) return data;
+      if (q > 0.45) q -= 0.08;
+      else {
+        const s2 = document.createElement('canvas');
+        s2.width = Math.round(c.width * 0.82); s2.height = Math.round(c.height * 0.82);
+        s2.getContext('2d').drawImage(c, 0, 0, s2.width, s2.height);
+        c = s2; q = 0.6;
+      }
+    }
+    return data.length <= 44000 ? data : '';
+  }
+
+  const STICKERS = ['🎉', '🏠', '💪', '🔨', '⭐', '❤️', '👏', '🔥', '😎', '🙌', '✅', '🌞'];
+  let snap = null;
+  /** Snapchat-style: take a photo, add a caption and stickers, send. kind = roof | story | team. */
+  function openSnap(kind, sid) {
+    const s = sid ? S.surveys.get(sid) : null;
+    const title = kind === 'roof' ? 'Roof photo' + (s ? ' · ' + (s.code || s.family || '') : '') : kind === 'team' ? 'Team picture' : 'New story';
+    snap = { kind, sid: sid || '', img: null, stickers: [], caption: '' };
+    showSheet('<div class="snap"><h2>' + esc(title) + '</h2>' +
+      '<p class="small muted" style="margin:0">' + (kind === 'story' ? 'Everyone sees it on the dashboard for 7 days.' : kind === 'team' ? 'Shown next to your team in the rankings.' : 'Shown in “Latest roofs” on the dashboard.') + ' Photos are kept small, inside the sheet.</p>' +
+      '<div class="snap-stage" id="snapStage"><label class="snap-pick"><span>📸</span><b>Take or choose a photo</b><input type="file" accept="image/*" capture="environment" id="snapFile"></label></div>' +
+      '<div id="snapTools" hidden>' +
+      '<label class="field wide"><span>Caption</span><input type="text" id="snapCaption" maxlength="80" dir="auto" placeholder="' + (kind === 'roof' ? 'Done! Another dry home' : 'Say something') + '"></label>' +
+      '<div class="sticker-bar" role="group" aria-label="Stickers">' + STICKERS.map((e) => '<button type="button" class="sticker-btn" data-sticker="' + e + '">' + e + '</button>').join('') + '</div>' +
+      '<p class="small muted" style="margin:0">Tap a sticker to add it, drag it on the photo, tap it there to remove it.</p></div>' +
+      '<div id="snapMsg"></div>' +
+      '<div class="btn-row"><button class="btn leaf" data-act="snap-send" id="snapSend" disabled>Send</button><button class="btn quiet" data-act="close-sheet">Cancel</button></div></div>');
+    $('#snapFile').addEventListener('change', async (e) => {
+      const f = e.target.files && e.target.files[0];
+      if (!f || !/^image\//.test(f.type)) return;
+      try {
+        const img = await decodeImage(f);
+        const max = 720, r = Math.min(1, max / Math.max(img.naturalWidth || img.width, img.naturalHeight || img.height));
+        const c = document.createElement('canvas');
+        c.width = Math.round((img.naturalWidth || img.width) * r); c.height = Math.round((img.naturalHeight || img.height) * r);
+        c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+        snap.img = c;
+        $('#snapStage').innerHTML = '<div class="snap-photo" id="snapPhoto"><img src="' + c.toDataURL('image/jpeg', 0.85) + '" alt="Your photo"><div class="snap-cap" id="snapCapView" hidden></div></div>';
+        $('#snapTools').hidden = false;
+        $('#snapSend').disabled = false;
+        $('#snapCaption').addEventListener('input', (ev) => { snap.caption = ev.target.value; const v = $('#snapCapView'); v.hidden = !snap.caption; v.textContent = snap.caption; });
+        wireStickers();
+      } catch (err) { $('#snapMsg').innerHTML = '<div class="notice err small"><div>This photo could not be opened.</div></div>'; }
+    });
+  }
+  function wireStickers() {
+    const box = $('#snapPhoto');
+    let drag = null;
+    box.addEventListener('pointerdown', (e) => {
+      const el = e.target.closest('.snap-sticker');
+      if (!el) return;
+      e.preventDefault();
+      el.setPointerCapture(e.pointerId);
+      drag = { el, moved: false, sx: e.clientX, sy: e.clientY };
+    });
+    box.addEventListener('pointermove', (e) => {
+      if (!drag) return;
+      const r = box.getBoundingClientRect();
+      if (Math.abs(e.clientX - drag.sx) + Math.abs(e.clientY - drag.sy) > 6) drag.moved = true;
+      const st = snap.stickers[Number(drag.el.dataset.i)];
+      st.x = clamp((e.clientX - r.left) / r.width, 0.05, 0.95); st.y = clamp((e.clientY - r.top) / r.height, 0.05, 0.95);
+      drag.el.style.left = (st.x * 100) + '%'; drag.el.style.top = (st.y * 100) + '%';
+    });
+    box.addEventListener('pointerup', () => {
+      if (drag && !drag.moved) { snap.stickers[Number(drag.el.dataset.i)].gone = true; drag.el.remove(); }
+      drag = null;
+    });
+  }
+  function addSticker(e) {
+    const box = $('#snapPhoto');
+    if (!box || !snap) return;
+    const st = { e, x: 0.3 + Math.random() * 0.4, y: 0.25 + Math.random() * 0.3 };
+    snap.stickers.push(st);
+    const el = document.createElement('span');
+    el.className = 'snap-sticker'; el.textContent = e; el.dataset.i = String(snap.stickers.length - 1);
+    el.style.left = (st.x * 100) + '%'; el.style.top = (st.y * 100) + '%';
+    box.appendChild(el);
+  }
+  /** Burn caption, stickers and a small stamp into the picture, like a snap. */
+  function composeSnap() {
+    const src = snap.img, c = document.createElement('canvas');
+    c.width = src.width; c.height = src.height;
+    const ctx = c.getContext('2d');
+    ctx.drawImage(src, 0, 0);
+    const u = c.width / 360;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    snap.stickers.filter((x) => !x.gone).forEach((x) => { ctx.font = Math.round(44 * u) + 'px system-ui, "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif'; ctx.fillText(x.e, x.x * c.width, x.y * c.height); });
+    if (snap.caption) {
+      const bandH = Math.round(34 * u), y = Math.round(c.height * 0.68);
+      ctx.fillStyle = 'rgba(0,0,0,0.55)'; ctx.fillRect(0, y - bandH / 2, c.width, bandH);
+      ctx.fillStyle = '#FFFFFF'; ctx.font = '600 ' + Math.round(17 * u) + 'px system-ui, sans-serif';
+      ctx.direction = /[؀-ۿ]/.test(snap.caption) ? 'rtl' : 'ltr';
+      ctx.fillText(snap.caption, c.width / 2, y, c.width - 20 * u);
+      ctx.direction = 'ltr';
+    }
+    const s = snap.sid ? S.surveys.get(snap.sid) : null;
+    const stamp = snap.kind === 'roof' ? '✓ Roofed · ' + [s && s.code, S.me.name, fmtDay(today())].filter(Boolean).join(' · ') : snap.kind === 'team' ? 'Team ' + S.me.name : S.me.name + ' · ' + fmtDay(today());
+    ctx.font = '600 ' + Math.round(11 * u) + 'px system-ui, sans-serif';
+    const tw = ctx.measureText(stamp).width + 14 * u, th = 20 * u;
+    ctx.fillStyle = 'rgba(0,0,0,0.5)'; ctx.fillRect(8 * u, c.height - th - 8 * u, tw, th);
+    ctx.fillStyle = '#FFFFFF'; ctx.textAlign = 'left'; ctx.fillText(stamp, 15 * u, c.height - th / 2 - 8 * u);
+    return c;
+  }
+  async function sendSnap() {
+    if (!snap || !snap.img) return;
+    const data = fitJpeg(composeSnap());
+    if (!data) { $('#snapMsg').innerHTML = '<div class="notice err small"><div>This photo could not be made small enough. Try another one.</div></div>'; return; }
+    const localId = 'local-' + uid();
+    const s = snap.sid ? S.surveys.get(snap.sid) : null;
+    const item = { kind: snap.kind, surveyId: snap.sid, image: data, caption: (snap.caption || '').slice(0, 120), localId };
+    // shows at once on this phone, uploads with the next sync (works offline)
+    S.photos = (S.photos || []).concat([{ id: localId, local: true, kind: item.kind, surveyId: item.surveyId, code: s ? s.code : '', teamId: isLeader() ? S.me.id : '',
+      team: isLeader() ? S.me.name : '', by: S.me.name, byId: S.me.id, caption: item.caption, time: nowIso(), image: data }]);
+    S.pendingPhotos = (S.pendingPhotos || []).concat([item]).slice(-10);
+    await DB.setMeta('photos', S.photos); await DB.setMeta('pendingPhotos', S.pendingPhotos);
+    snap = null;
+    closeSheet();
+    toast(item.kind === 'story' ? 'Story posted 🎉' : 'Photo saved 🎉');
+    scheduleSync(200);
+    route();
+  }
+
+  /** Full-screen story viewer: tap right for next, left for back; moves on by itself. */
+  let storyTimer = null;
+  function showStories(list, i) {
+    clearTimeout(storyTimer);
+    if (!list[i]) { closeSheet(); return; }
+    const p = list[i];
+    const mine = p.byId === S.me.id || isMgr();
+    showSheet('<div class="story-view" data-story-i="' + i + '">' +
+      '<div class="story-bars">' + list.map((x, k) => '<i class="' + (k < i ? 'done' : k === i ? 'now' : '') + '"></i>').join('') + '</div>' +
+      '<div class="story-top"><b dir="auto">' + esc(p.by || '') + '</b><span>' + esc(fmtWhen(p.time)) + (p.code ? ' · ' + esc(p.code) : '') + '</span></div>' +
+      '<img src="data:image/jpeg;base64,' + (p.image || '') + '" alt="' + esc(p.caption || 'Photo') + '">' +
+      '<button class="story-nav prev" data-storynav="' + (i - 1) + '" aria-label="Previous"></button><button class="story-nav next" data-storynav="' + (i + 1) + '" aria-label="Next"></button>' +
+      '<div class="story-actions">' + (mine && !p.local ? '<button class="btn quiet sm" data-delphoto="' + esc(p.id) + '">Delete</button>' : '') + '<button class="btn sm" data-act="close-sheet">Close</button></div></div>');
+    S.storyList = list;
+    storyTimer = setTimeout(() => { if ($('.story-view')) showStories(list, i + 1); }, 5000);
   }
 
   /** Managers: name, date, team leader, and which approved houses go into the day. */
@@ -1925,7 +2343,8 @@
     const t = id ? S.tasks.find((x) => x.id === id) : null;
     const key = id || 'new';
     if (!S.dayDraft || S.dayDraft.key !== key) {
-      S.dayDraft = { key, id: t ? t.id : uid(), isNew: !t, name: t ? t.name : '', date: t ? t.date : today(), leaderId: t ? t.leaderId || '' : '', picked: new Set(t ? t.surveyIds : []), q: '' };
+      S.dayDraft = { key, id: t ? t.id : uid(), isNew: !t, name: t ? t.name : '', date: t ? t.date : today(), leaderId: t ? t.leaderId || '' : '',
+        picked: new Set(t ? t.surveyIds : []), houseLeaders: Object.assign({}, (t && t.houseLeaders) || {}), q: '' };
     }
     const d = S.dayDraft;
     const leaders = S.leaders.slice();
@@ -1948,7 +2367,7 @@
       '<div class="bottombar wide"><div class="bottombar-inner"><button class="btn ghost" data-act="go-days">Cancel</button><span class="grow"></span><button class="btn leaf" data-act="save-day">' + ICON.check + 'Save day</button></div></div>';
     $('#d-name').addEventListener('input', (e) => { d.name = e.target.value; const h = $('#title'); if (h) h.textContent = d.name || 'New day'; });
     $('#d-date').addEventListener('input', (e) => { d.date = e.target.value; });
-    $('#d-leader').addEventListener('change', (e) => { d.leaderId = e.target.value; });
+    $('#d-leader').addEventListener('change', (e) => { d.leaderId = e.target.value; renderDayHouses(); });
     $('#d-q').addEventListener('input', (e) => { d.q = e.target.value; renderDayHouses(); });
     renderDayHouses();
     renderDayTotals();
@@ -1966,12 +2385,18 @@
       const other = S.tasks.find((t) => t.id !== d.id && (t.surveyIds || []).indexOf(s.id) >= 0);
       const w = calcWood(s.rooms, S.config.rules);
       const notReady = s.status !== 'Approved' && s.status !== 'Roofed';
-      return '<label class="pick-row' + (d.picked.has(s.id) ? ' on' : '') + '"><input type="checkbox" data-dpick="' + esc(s.id) + '"' + (d.picked.has(s.id) ? ' checked' : '') + (notReady && !d.picked.has(s.id) ? ' disabled' : '') + '>' +
+      const on = d.picked.has(s.id);
+      const dayLeader = (S.leaders.find((l) => l.id === d.leaderId) || {}).name;
+      return '<div class="pick-row' + (on ? ' on' : '') + '"><label class="pick-hit"><input type="checkbox" data-dpick="' + esc(s.id) + '"' + (on ? ' checked' : '') + (notReady && !on ? ' disabled' : '') + '>' +
         '<span class="pick-main"><b dir="auto">' + esc(s.family || 'No name') + '</b><span class="sub">' + [s.code, s.area, w.roofed + ' to roof'].filter(Boolean).map((x) => '<bdi>' + esc(x) + '</bdi>').join(' · ') + '</span>' +
-        (other ? '<span class="sub warnline">Now in <bdi>' + esc(other.name) + '</bdi>' + (d.picked.has(s.id) ? '' : ': ticking moves it here') + '</span>' : '') +
+        (other ? '<span class="sub warnline">Now in <bdi>' + esc(other.name) + '</bdi>' + (on ? '' : ': ticking moves it here') + '</span>' : '') +
         (notReady ? '<span class="sub warnline">' + esc(s.status) + ': not approved any more, it will be left out</span>' : '') +
         (hasLoc(s) ? '' : '<span class="sub muted">No location saved</span>') +
-        '</span><span class="status st-' + esc(s.status) + '">' + esc(s.status) + '</span></label>';
+        '</span><span class="status st-' + esc(s.status) + '">' + esc(s.status) + '</span></label>' +
+        (on ? '<label class="pick-leader"><span class="small muted">Team leader</span><select data-hleader="' + esc(s.id) + '">' +
+          '<option value="">' + esc(dayLeader ? 'Day\'s leader (' + dayLeader + ')' : 'Day\'s leader (any)') + '</option>' +
+          S.leaders.map((l) => '<option value="' + esc(l.id) + '"' + (d.houseLeaders[s.id] === l.id ? ' selected' : '') + '>' + esc(l.name) + '</option>').join('') +
+          '</select></label>' : '') + '</div>';
     }).join('') : '<p class="muted">' + (words.length ? 'No matches.' : 'No approved houses yet. A manager approves surveys first (open a survey → Approve).') + '</p>';
   }
 
@@ -1992,7 +2417,9 @@
     const d = S.dayDraft;
     if (!d) return;
     const name = (d.name || '').trim() || ('Day ' + (d.date || today()));
-    const task = { id: d.id, name, date: d.date || '', leaderId: d.leaderId || '', surveyIds: Array.from(d.picked) };
+    const houseLeaders = {};
+    d.picked.forEach((sid) => { if (d.houseLeaders[sid] && d.houseLeaders[sid] !== d.leaderId) houseLeaders[sid] = d.houseLeaders[sid]; });
+    const task = { id: d.id, name, date: d.date || '', leaderId: d.leaderId || '', surveyIds: Array.from(d.picked), houseLeaders };
     const leader = S.leaders.find((l) => l.id === task.leaderId);
     const local = Object.assign({}, task, { leaderName: leader ? leader.name : '' });
     S.tasks.forEach((o) => { if (o.id !== task.id) o.surveyIds = (o.surveyIds || []).filter((x) => !d.picked.has(x)); }); // one day per house
@@ -2032,15 +2459,32 @@
     if (!CFG.demo) S.pendingStates.push({ surveyId: s.id, state });
     await DB.setMeta('pendingStates', S.pendingStates);
     s.status = state === 'Roofed' ? 'Roofed' : 'Approved';
+    if (state === 'Roofed') { s.roofedAt = nowIso(); s.roofedBy = S.me.name; if (isLeader()) { s.teamId = s.teamId || S.me.id; } }
+    else { s.roofedAt = ''; s.roofedBy = ''; }
     await DB.put('surveys', s);
-    toast((s.family || 'House') + ': ' + (state === 'Roofed' ? 'roofed' : 'pending'));
     updateSyncPill();
     scheduleSync(300);
     route();
+    if (state === 'Roofed' && (isLeader() || isMgr())) { // celebrate, and ask for the roof photo
+      showSheet('<div class="celebrate"><div class="big-emoji" aria-hidden="true">🎉</div><h2 dir="auto">' + esc(s.family || 'House') + ' is roofed!</h2>' +
+        '<p class="muted">Snap a photo of the new roof for the dashboard?</p>' +
+        '<div class="btn-row"><button class="btn leaf" data-snap="roof" data-sid="' + esc(s.id) + '">📸 Roof photo</button><button class="btn quiet" data-act="close-sheet">Later</button></div></div>');
+    } else toast((s.family || 'House') + ': ' + (state === 'Roofed' ? 'roofed' : 'pending'));
+  }
+
+  /** The house location is required before a survey leaves Draft. */
+  const leavesDraft = (s, to) => (s.status || 'Draft') === 'Draft' && to !== 'Draft' && to !== 'Cancelled';
+  function askForLocation(s) {
+    toast('Save the house location first: it is required.', 4000);
+    S.cur.step = 0; S.stepOf[s.id] = 0;
+    renderEditor(s.id);
+    const p = $('#locPanel');
+    if (p) { p.classList.add('needed'); p.scrollIntoView({ block: 'center' }); }
   }
 
   function setStatus(s, to) {
-    if (isLeader()) { markHouse(s, to === 'Roofed' ? 'Roofed' : 'Pending'); return; }
+    if (leavesDraft(s, to) && !hasLoc(s)) { askForLocation(s); return; }
+    if (isLeader() && (to === 'Roofed' || to === 'Pending')) { markHouse(s, to); return; }
     if (to === s.status) return;
     s.status = to;
     if (to === 'Reviewed') s.reviewer = S.me.name;
@@ -2068,13 +2512,20 @@
     const users = S.users.slice();
     const order = ['Admin', 'Manager', 'Team leader', 'Researcher'];
     const label = { Admin: 'Admins', Manager: 'Managers', 'Team leader': 'Team leaders', Researcher: 'Researchers' };
-    const groups = order.map((r) => [r, users.filter((u) => u.role === r).sort((a, b) => (b.active - a.active) || a.name.localeCompare(b.name))]).filter((g) => g[1].length);
+    const waiting = users.filter((u) => u.pending).sort((a, b) => String(b.lastSeen).localeCompare(String(a.lastSeen)));
+    const groups = order.map((r) => [r, users.filter((u) => !u.pending && u.role === r).sort((a, b) => (b.active - a.active) || a.name.localeCompare(b.name))]).filter((g) => g[1].length);
     app().innerHTML = appbar({ eyebrow: 'Lebaladna · Shelter · ' + (S.me.name || '') + ' (Admin)', title: 'Users', wide: true,
       actions: '<button class="iconbtn" data-act="go-me" aria-label="Settings">' + ICON.gear + '</button>' }) +
       '<main class="page wide"><div class="page-inner">' + navTabs('users') +
       '<div class="notice info small"><div>Everyone logs in with their name and the team code' + (S.teamCode ? ' <b class="data">' + esc(S.teamCode) + '</b>' : '') +
       '. They appear here the first time and start as Researchers. Tap a person to make them Team leader or Manager, or to set them back.</div></div>' +
       (navigator.onLine === false ? '<div class="notice warn small"><div>Offline. Changing roles needs internet.</div></div>' : '') +
+      (waiting.length ? '<section class="panel wait-panel"><div class="panel-head"><h2>⏳ Waiting to be let in <span class="badge">' + waiting.length + '</span></h2></div>' +
+        '<p class="small muted" style="margin:0">They logged in with the team code. Let in only people you know; they then see all surveys, including national IDs.</p>' +
+        '<div class="list">' + waiting.map((u) => '<div class="card user-card">' +
+          '<div class="main"><div class="fam" dir="auto">' + esc(u.name) + '</div><div class="sub">' + [u.device, u.lastSeen ? 'joined ' + fmtWhen(u.lastSeen) : ''].filter(Boolean).map((x) => '<bdi>' + esc(x) + '</bdi>').join(' · ') + '</div></div>' +
+          '<div class="side btn-row"><button class="btn leaf sm" data-letin="' + esc(u.id) + '">Let in</button><button class="btn quiet sm" data-refuse="' + esc(u.id) + '">Refuse</button></div></div>').join('') +
+        '</div></section>' : '') +
       (groups.length ? groups.map((g) => '<h2 class="list-title">' + esc(label[g[0]]) + ' <span class="muted small">' + g[1].length + '</span></h2><div class="list">' +
         g[1].map((u) => '<div class="card user-card' + (u.active ? '' : ' off') + '" role="button" tabindex="0" data-edituser="' + esc(u.id) + '">' +
           '<div class="main"><div class="fam" dir="auto">' + esc(u.name) + (u.id === S.me.id ? ' <span class="muted small">(you)</span>' : '') + '</div>' +
@@ -2088,6 +2539,7 @@
     const msg = $('#u-msg');
     if (CFG.demo) {
       Object.assign(u, change);
+      if ('active' in change) u.pending = false;
       S.leaders = S.users.filter((x) => x.active && x.role === 'Team leader').map((x) => ({ id: x.id, name: x.name }));
       closeSheet(); renderUsers(); toast(okText + ' (preview only)');
       return;
@@ -2139,22 +2591,85 @@
   }
 
   /* ── History of one survey ───────────────────────── */
+  /** Field by field, what one change did: [label, before, after]. */
+  const HIST_FIELDS = [['status', 'Status'], ['family', 'Head of family'], ['area', 'Area'], ['mobile', 'Mobile'], ['nationalId', 'National ID'],
+    ['age', 'Age'], ['members', 'Family members'], ['grade', 'Case grade'], ['job', 'Job'], ['income', 'Monthly income'],
+    ['project', 'Project'], ['date', 'Survey date'], ['notes', 'Notes'], ['reviewer', 'Reviewed by'], ['approvedBy', 'Approved by'],
+    ['day', 'Implementation day'], ['leaderName', 'Team leader']];
+  function fieldDiffs(b, a) {
+    const out = [];
+    if (!b && !a) return out;
+    const B = b || {}, A = a || {};
+    const v = (x) => String(x == null ? '' : x).trim();
+    HIST_FIELDS.forEach(([k, label]) => { if (v(B[k]) !== v(A[k])) out.push([label, v(B[k]), v(A[k])]); });
+    const loc = (o) => (o && o.location && isFinite(o.location.lat) ? fix6(o.location.lat) + ', ' + fix6(o.location.lng) : '');
+    if (loc(B) !== loc(A)) out.push(['Location', loc(B), loc(A)]);
+    const size = (r) => (r ? (r.name || 'Room') + ': ' + (fmtM(toNum(r.beamSide)) || '?') + ' × ' + (fmtM(toNum(r.plankSide)) || '?') + (r.roof ? '' : ' (no roof)') : '');
+    const rb = new Map((B.rooms || []).map((r) => [r.id, r])), ra = new Map((A.rooms || []).map((r) => [r.id, r]));
+    ra.forEach((r, id) => { if (size(rb.get(id)) !== size(r)) out.push(['Room', size(rb.get(id)), size(r)]); });
+    rb.forEach((r, id) => { if (!ra.has(id)) out.push(['Room', size(r), '']); });
+    return out;
+  }
+
+  /** Managers and admins: who changed this survey, when, from which phone, before → after, and Restore. */
   async function showHistory(s) {
     showSheet('<h2>History</h2><p class="muted">Loading…</p>');
-    if (CFG.demo) { showSheet('<h2>History</h2><p class="muted">In the installed app, every change is listed here: who, when, from which phone, and what changed. The sheet keeps a copy before and after each change (tab “History”).</p><div class="btn-row"><button class="btn" data-act="close-sheet">Close</button></div>'); return; }
+    if (CFG.demo) { showSheet('<h2>History</h2><p class="muted">In the installed app, managers see every change here: who, when, from which phone, each field before and after, and a button to restore the version from before a change.</p><div class="btn-row"><button class="btn" data-act="close-sheet">Close</button></div>'); return; }
     try {
-      const res = await api('getHistory', { surveyId: s.id }, 30000);
+      const res = await api('getHistory', { surveyId: s.id }, 45000);
       const rows = res.history || [];
-      showSheet('<h2>History</h2><p class="small muted" style="margin:0">' + esc((s.code || '') + ' · ' + (s.family || '')) + ' · the sheet keeps a copy before and after each change (tab “History”).</p>' +
-        (rows.length ? '<ol class="history">' + rows.map((h) => '<li><div class="h-top"><b dir="auto">' + esc(h.who || '—') + '</b><span class="muted small">' + esc([h.role, fmtStamp(h.time)].filter(Boolean).join(' · ')) + '</span></div>' +
-          '<div class="h-act">' + esc(h.action) + (h.device ? ' <span class="muted small">· ' + esc(h.device) + '</span>' : '') + '</div>' +
-          '<div class="h-changes" dir="auto">' + esc(h.changes).replace(/; /g, '<br>') + '</div></li>').join('') + '</ol>'
-          : '<p class="muted">No changes recorded yet. (Changes made before this update are not listed.)</p>') +
+      S.histFor = s.id;
+      showSheet('<h2>History</h2><p class="small muted" style="margin:0"><bdi>' + esc((s.code || '') + ' · ' + (s.family || '')) + '</bdi> · newest first. The sheet keeps a full copy before and after each change (tab “History”).</p>' +
+        (rows.length ? '<ol class="history">' + rows.map((h) => {
+          const d = fieldDiffs(h.before, h.after);
+          const table = d.length && h.before ? '<table class="diff"><thead><tr><th>What</th><th>Before</th><th>After</th></tr></thead><tbody>' +
+            d.map((x) => '<tr><td>' + esc(x[0]) + '</td><td class="old" dir="auto">' + (x[1] ? esc(x[1]) : '<span class="muted">–</span>') + '</td><td class="new" dir="auto">' + (x[2] ? esc(x[2]) : '<span class="muted">–</span>') + '</td></tr>').join('') + '</tbody></table>'
+            : '<div class="h-changes" dir="auto">' + esc(h.changes).replace(/; /g, '<br>') + '</div>';
+          return '<li><div class="h-top"><b dir="auto">' + esc(h.who || '—') + '</b><span class="muted small">' + esc([h.role, fmtStamp(h.time)].filter(Boolean).join(' · ')) + '</span></div>' +
+            '<div class="h-act">' + esc(h.action) + (h.device ? ' <span class="muted small">· ' + esc(h.device) + '</span>' : '') + '</div>' + table +
+            (h.canRestore ? '<div class="btn-row"><button class="btn quiet sm" data-restore="' + esc(h.id) + '">↺ Restore the version from before this change</button></div>' : '') + '</li>';
+        }).join('') + '</ol>'
+          : '<p class="muted">No changes recorded yet. (Changes made before 1.5.1 are not listed.)</p>') +
         '<div class="btn-row"><button class="btn" data-act="close-sheet">Close</button></div>');
     } catch (err) {
       showSheet('<h2>History</h2><div class="notice warn"><div>' + esc(err.code === 'offline' ? 'Connect to the internet to see the history.' : err.message) + '</div></div><div class="btn-row"><button class="btn" data-act="close-sheet">Close</button></div>');
     }
   }
+
+  async function restoreVersion(changeId, btn) {
+    const s = S.surveys.get(S.histFor);
+    if (!s) return;
+    if (s.dirty) { toast('This survey has changes not uploaded yet. Sync first, then restore.', 4000); return; }
+    btn.disabled = true; btn.textContent = 'Restoring…';
+    try {
+      await api('restoreVersion', { changeId }, 60000);
+      closeSheet();
+      toast('Restored. The restore itself is in the history too.', 4000);
+      await syncNow();
+      if (currentView === 'editor' && S.cur && S.cur.id === s.id) renderEditor(s.id);
+    } catch (err) {
+      btn.disabled = false; btn.textContent = '↺ Restore the version from before this change';
+      toast(err.code === 'offline' ? 'Restoring needs internet.' : err.message || 'Could not restore', 4000);
+    }
+  }
+
+  /** Managers' dashboard: the latest changes to any survey. */
+  async function loadRecent() {
+    if (!isMgr() || CFG.demo || !apiUrl()) return false;
+    try { const res = await api('recentChanges', {}, 30000); S.recent = res.changes || []; return true; }
+    catch (e) { return false; }
+  }
+  function recentPanel() {
+    if (!isMgr()) return '';
+    const list = (S.recent || []).slice(0, 15);
+    return '<section class="panel"><div class="panel-head"><h2>📝 Recent changes</h2><span class="small muted">tap one for before → after</span></div>' +
+      (list.length ? '<ol class="recent">' + list.map((c) => '<li><button class="recent-row" data-histsurvey="' + esc(c.surveyId) + '">' +
+        '<span class="r-top"><b dir="auto">' + esc(c.who || '—') + '</b> <span class="muted small">' + esc([c.role, fmtWhen(c.time)].filter(Boolean).join(' · ')) + '</span></span>' +
+        '<span class="small"><b>' + esc(c.action) + '</b> · <bdi>' + esc([c.code, c.about].filter(Boolean).join(' · ')) + '</bdi></span>' +
+        '<span class="small muted r-ch" dir="auto">' + esc(c.changes) + '</span></button></li>').join('') + '</ol>'
+        : '<p class="muted">' + (S.recent ? 'No changes yet.' : 'Open with internet to load the latest changes.') + '</p>') + '</section>';
+  }
+
   function fmtStamp(iso) {
     const d = new Date(iso);
     return isNaN(d) ? String(iso || '') : d.toLocaleString(undefined, { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
@@ -2624,9 +3139,10 @@
     pres.title = opts.title ? 'Shelter – ' + opts.title : list.length > 1 ? 'Shelter purchase list' : 'Shelter survey ' + (list[0].code || '');
     if (withSummary) summarySlide(pres, list, logoData, opts);
     list.forEach((s) => { ensureLayout(s); surveySlide(pres, s, logoData); });
-    let blob = await pres.write({ outputType: 'blob' });
-    if (!(blob instanceof Blob)) blob = new Blob([blob], { type: 'application/vnd.openxmlformats-officedocument.presentationml.presentation' });
-    return blob;
+    // PptxGenJS labels its file as a plain zip; phones then save it as .zip and open it in an archive app.
+    // Give it the real PowerPoint type so it opens in PowerPoint / Google Slides.
+    const buf = await pres.write({ outputType: 'arraybuffer' });
+    return new Blob([buf], { type: EXPORT_KIND.pptx.type });
   }
 
   const hex = (c) => c.replace('#', '').toUpperCase();
@@ -2851,7 +3367,8 @@
     try {
       const blob = kind === 'png' ? await buildPng(list[0]) : kind === 'pdf' ? await buildPdf(list, opts) : await buildPptx(list, opts);
       const name = exportName(list, K.ext, kind === 'png' ? null : opts);
-      lastExport = { blob, name, type: K.type };
+      const typed = blob.type === K.type ? blob : new Blob([blob], { type: K.type }); // the right file type, always
+      lastExport = { blob: typed, name, type: K.type };
       if (viewerUrl) URL.revokeObjectURL(viewerUrl);
       viewerUrl = kind === 'png' ? URL.createObjectURL(blob) : null;
       const canShare = (() => { try { return !!(navigator.canShare && navigator.canShare({ files: [new File([blob], name, { type: lastExport.type })] })); } catch (e) { return false; } })();
@@ -2897,6 +3414,7 @@
     back.innerHTML = '<div class="sheet" role="dialog" aria-modal="true">' + inner + '</div>';
   }
   function closeSheet() {
+    clearTimeout(storyTimer);
     const b = $('#sheetBack');
     if (b) b.remove();
     if (viewerUrl) { URL.revokeObjectURL(viewerUrl); viewerUrl = null; }
@@ -2924,11 +3442,64 @@
     const openHouse = t.closest('[data-openhouse]');
     if (openHouse) { const id = openHouse.dataset.openhouse; if (isLeader()) S.stepOf[id] = 2; go('survey-' + id); return; }
 
+    const snapEl = t.closest('[data-snap]');
+    if (snapEl) { openSnap(snapEl.dataset.snap, snapEl.dataset.sid || ''); return; }
+    const stickerEl = t.closest('[data-sticker]');
+    if (stickerEl) { addSticker(stickerEl.dataset.sticker); return; }
+    const storyEl = t.closest('[data-story]');
+    if (storyEl) {
+      const all = (S.photos || []).filter((p) => p.kind === 'story').sort((a, b) => (a.time < b.time ? 1 : -1));
+      const authors = [];
+      all.forEach((p) => { if (authors.indexOf(p.byId) < 0) authors.push(p.byId); });
+      const ordered = [];
+      authors.forEach((a) => all.filter((p) => p.byId === a).reverse().forEach((p) => ordered.push(p)));
+      const first = ordered.findIndex((p) => p.byId === authors[Number(storyEl.dataset.story)]);
+      showStories(ordered, Math.max(0, first));
+      return;
+    }
+    const roofPh = t.closest('[data-roofphoto]');
+    if (roofPh) { const roofs = (S.photos || []).filter((p) => p.kind === 'roof').sort((a, b) => (a.time < b.time ? 1 : -1)).slice(0, 12); showStories(roofs, Number(roofPh.dataset.roofphoto)); return; }
+    const navEl = t.closest('[data-storynav]');
+    if (navEl && S.storyList) { showStories(S.storyList, Number(navEl.dataset.storynav)); return; }
+    const delPh = t.closest('[data-delphoto]');
+    if (delPh) {
+      const id = delPh.dataset.delphoto;
+      try { await api('deletePhoto', { id }, 30000); S.photos = (S.photos || []).filter((p) => p.id !== id); await DB.setMeta('photos', S.photos); closeSheet(); toast('Deleted'); route(); }
+      catch (err) { toast(err.code === 'offline' ? 'Deleting a photo needs internet.' : err.message || 'Could not delete'); }
+      return;
+    }
+    const restoreEl = t.closest('[data-restore]');
+    if (restoreEl) {
+      if (removeArm.get('restore') === restoreEl.dataset.restore) { removeArm.delete('restore'); restoreVersion(restoreEl.dataset.restore, restoreEl); }
+      else {
+        removeArm.set('restore', restoreEl.dataset.restore); restoreEl.textContent = 'Tap again to restore this version';
+        setTimeout(() => { if (removeArm.get('restore') === restoreEl.dataset.restore) removeArm.delete('restore'); if (restoreEl.isConnected && !restoreEl.disabled) restoreEl.textContent = '↺ Restore the version from before this change'; }, 4000);
+      }
+      return;
+    }
+    const histEl = t.closest('[data-histsurvey]');
+    if (histEl) {
+      const hs = S.surveys.get(histEl.dataset.histsurvey);
+      if (!hs) { toast('That survey is not on this phone (deleted?).'); return; }
+      S.stepOf[hs.id] = 4; go('survey-' + hs.id);
+      setTimeout(() => showHistory(hs), 50);
+      return;
+    }
+    const periodEl = t.closest('[data-period]');
+    if (periodEl) { S.dash.period = periodEl.dataset.period; renderDash(); return; }
+
     const markEl = t.closest('[data-mark]');
     if (markEl) { const hs = S.surveys.get(markEl.dataset.mark); if (hs) markHouse(hs, markEl.dataset.state); return; }
 
     const editUser = t.closest('[data-edituser]');
     if (editUser) { userSheet(S.users.find((u) => u.id === editUser.dataset.edituser)); return; }
+
+    const letIn = t.closest('[data-letin]'), refuse = t.closest('[data-refuse]');
+    if (letIn || refuse) {
+      const u = S.users.find((x) => x.id === (letIn || refuse).dataset[letIn ? 'letin' : 'refuse']);
+      if (u) saveUserChange(u, { active: !!letIn }, u.name + (letIn ? ' can now use the app' : ' was refused'));
+      return;
+    }
 
     const roleBtn = t.closest('[data-setrole]');
     if (roleBtn && S.userEdit) { const r = roleBtn.dataset.setrole; if (r !== S.userEdit.role) saveUserChange(S.userEdit, { role: r }, S.userEdit.name + ' is now ' + r); return; }
@@ -2994,6 +3565,28 @@
         break;
       }
       case 'history': if (s) showHistory(s); break;
+      case 'snap-send': sendSnap(); break;
+      case 'check-again': checkAgain(false); break;
+      case 'submit-survey':
+        if (s && canEdit(s)) {
+          if (!hasLoc(s)) { askForLocation(s); break; }
+          s.status = 'Submitted'; touch(s); toast('Submitted for review ✓'); go(S.backTo || '');
+        }
+        break;
+      case 'delete-picked': {
+        const n = Array.from(S.list.picked).map((id) => S.surveys.get(id)).filter((x) => x && canDelete(x)).length;
+        if (removeArm.get('picked')) { removeArm.delete('picked'); deletePicked(); }
+        else {
+          removeArm.set('picked', true); actEl.textContent = 'Tap again to delete ' + n;
+          setTimeout(() => { removeArm.delete('picked'); if (actEl.isConnected) actEl.textContent = 'Delete ' + n; }, 4000);
+        }
+        break;
+      }
+      case 'export-mine': {
+        const task = S.tasks.find((x) => x.id === actEl.dataset.task);
+        if (task) runExport(actEl.dataset.kind, taskSurveys(task).filter(isMyHouse), { title: task.name + (task.date ? ' · ' + task.date : ''), leader: S.me.name, summary: false });
+        break;
+      }
       case 'gen-code': { const c = $('#u-code'); if (c) c.value = randomCode(); break; }
       case 'logout': {
         if (removeArm.get('logout') || !pendingCount()) { removeArm.delete('logout'); logout(); }
@@ -3141,9 +3734,13 @@
       return;
     }
     if (t.matches('[data-statuspick]') && s) { setStatus(s, t.value); return; }
+    if (t.matches('[data-hleader]') && S.dayDraft) {
+      if (t.value) S.dayDraft.houseLeaders[t.dataset.hleader] = t.value; else delete S.dayDraft.houseLeaders[t.dataset.hleader];
+      return;
+    }
     if (t.matches('[data-dpick]') && S.dayDraft) {
       if (t.checked) S.dayDraft.picked.add(t.dataset.dpick); else S.dayDraft.picked.delete(t.dataset.dpick);
-      const row = t.closest('.pick-row'); if (row) row.classList.toggle('on', t.checked);
+      renderDayHouses(); // shows / hides that house's team leader choice
       renderDayTotals();
       return;
     }
@@ -3228,6 +3825,7 @@
       S.pendingDeletes = (await DB.meta('pendingDeletes')) || [];
       S.pendingStates = (await DB.meta('pendingStates')) || [];
       S.pendingTasks = (await DB.meta('pendingTasks')) || [];
+      await loadPhotos();
       S.tasks = (await DB.meta('tasks')) || [];
       S.leaders = (await DB.meta('leaders')) || [];
       S.users = (await DB.meta('users')) || [];
@@ -3252,7 +3850,8 @@
         { id: 'demo-admin', name: 'Begad (preview)', role: 'Admin', code: 'begd-1234', personal: true, active: true, device: 'This device', lastSeen: nowIso() },
         { id: 'demo-tl', name: 'Tarek (example)', role: 'Team leader', code: '', active: true, device: 'Android phone · Chrome', lastSeen: nowIso() },
         { id: 'demo-rv', name: 'Ali (example)', role: 'Researcher', code: '', active: true, device: 'Windows PC · Edge', lastSeen: nowIso() },
-        { id: 'demo-rs', name: 'Ahmed (example)', role: 'Researcher', code: '', active: true, device: 'Android phone · Samsung Internet', lastSeen: nowIso() }
+        { id: 'demo-rs', name: 'Ahmed (example)', role: 'Researcher', code: '', active: true, device: 'Android phone · Samsung Internet', lastSeen: nowIso() },
+        { id: 'demo-new', name: 'Karim (new)', role: 'Researcher', code: '', active: false, pending: true, device: 'iPhone · Safari', lastSeen: nowIso() }
       ];
     }
     window.addEventListener('hashchange', route);
@@ -3273,7 +3872,7 @@
   }
 
   // expose a tiny surface for testing
-  window.ShelterApp = { calcWood, parseLen, state: S, buildPdf, buildPptx, DB };
+  window.ShelterApp = { calcWood, parseLen, state: S, buildPdf, buildPptx, DB, cleanApi };
 
   boot();
 })();
