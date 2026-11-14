@@ -508,3 +508,13 @@ table.wood .sw { display: inline-block; width: 12px; height: 12px; border-radius
 .recent-row:hover, .recent-row:focus-visible { background: var(--sunk); }
 .recent-row:focus-visible { outline: 3px solid var(--brand); }
 .recent-row .r-ch { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* 1.7 – accounts */
+.wlinks { display: flex; flex-wrap: wrap; gap: 6px 18px; justify-content: center; padding: 4px 0 8px; }
+.linkbtn { all: unset; cursor: pointer; color: var(--brand); font-weight: 600; font-size: .95rem; padding: 8px 2px; border-radius: 4px; }
+.linkbtn:hover { text-decoration: underline; }
+.linkbtn:focus-visible { outline: 3px solid var(--brand); outline-offset: 2px; }
+.sheet-part { display: grid; gap: 10px; border-top: 1px solid var(--line); margin-top: 14px; padding-top: 14px; }
+.sheet-part h3 { margin: 0; font-size: 1rem; }
+.code-box { display: grid; gap: 8px; background: var(--sunk); border-radius: var(--r-sm); padding: 12px 14px; }
+.big-code { font-size: 2.2rem; font-weight: 700; letter-spacing: .12em; text-align: center; padding: 4px 0; }

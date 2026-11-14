@@ -1,7 +1,7 @@
 /* Shelter Surveys – keeps the app available without internet.
  * Change VERSION whenever you upload new app files, so phones fetch the update.
  */
-const VERSION = 'shelter-v1.6.1';
+const VERSION = 'shelter-v1.7.0';
 const SHELL = [
   './',
   './index.html',

@@ -13,7 +13,7 @@
     pptx: 'pptxgen.bundle.js',
     qr: 'qrcode.js'
   }, CFG.assets || {});
-  const APP_VERSION = '1.6.1';
+  const APP_VERSION = '1.7.0';
 
   const STATUSES = ['Draft', 'Submitted', 'Reviewed', 'Approved', 'Roofed', 'Cancelled'];
   const ROLES = ['Admin', 'Manager', 'Team leader', 'Researcher']; // researchers also review
@@ -405,15 +405,18 @@
     clearTimeout(syncTimer);
     syncTimer = setTimeout(syncNow, ms == null ? 2500 : ms);
   }
-  async function api(action, body, timeoutMs) {
+  /** One call to the sheet. `anon` = { url } for log in / sign up / forgot password (no identity sent). */
+  async function api(action, body, timeoutMs, anon) {
     const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
     const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs || 45000) : null;
+    const me = S.me || {};
+    const who = anon ? {} : Object.assign({ uid: me.id || '', token: me.token || '' }, me.key && !me.hasLogin ? { key: me.key } : {});
     let res;
     try {
-      res = await fetch(apiUrl(), {
+      res = await fetch(anon ? anon.url : apiUrl(), {
         method: 'POST',
         headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify(Object.assign({ action, key: S.me.key, uid: S.me.id || '', token: S.me.token || '', name: S.me.name, by: S.me.name, device: S.me.deviceId, deviceName: deviceName(), v: APP_VERSION }, body || {})),
+        body: JSON.stringify(Object.assign({ action, device: me.deviceId || '', deviceName: deviceName(), v: APP_VERSION }, who, body || {})),
         redirect: 'follow',
         signal: ctrl ? ctrl.signal : undefined
       });
@@ -443,7 +446,7 @@
 
   async function syncNow() {
     clearTimeout(syncTimer);
-    if (CFG.demo || !S.me || !S.me.name || S.needLogin || !apiUrl() || !S.me.key) { updateSyncPill(); return; }
+    if (CFG.demo || !S.me || !S.me.name || S.needLogin || !apiUrl() || !(S.me.token || S.me.key)) { updateSyncPill(); return; }
     if (syncing) { syncAgain = true; return; }
     if (navigator.onLine === false) { S.sync.state = 'offline'; updateSyncPill(); return; }
     syncing = true;
@@ -464,16 +467,13 @@
       DB.setMeta('lastSyncAt', S.lastSyncAt).catch(() => {});
     } catch (e) {
       if (e.code === 'offline') S.sync = { state: 'offline', msg: e.message };
-      else if (e.code === 'bad_key') {
-        S.sync = { state: 'badkey', msg: 'The code is no longer accepted. Enter the new code. Nothing on this phone is lost.' };
-        S.needLogin = 'The team code has changed. Type the new code to continue. Nothing on this phone is lost.';
-        setTimeout(route, 0);
-      }
-      else if (e.code === 'need_login') { // this phone's key is not in the Users tab any more: join again by name
-        S.me = Object.assign({}, S.me, { id: '', token: '', role: S.me.role });
+      else if (e.code === 'bad_key' || e.code === 'need_login') { // logged out (password changed or reset, or an old code)
+        S.me = Object.assign({}, S.me, { token: '', key: '' });
         await DB.setMeta('me', S.me);
-        S.sync = { state: 'wait', msg: 'Logging in again…' };
-        syncAgain = true;
+        S.sync = { state: 'badkey', msg: 'Log in again. Nothing on this phone is lost.' };
+        S.needLogin = 'Log in again with your username and password. Nothing on this phone is lost; it uploads after you log in.';
+        S.welcome = { mode: 'login' };
+        setTimeout(route, 0);
       }
       else if (e.code === 'pending') { // still waiting for an admin
         S.me = Object.assign({}, S.me, { role: 'Waiting' });
@@ -656,9 +656,13 @@
   async function applyMe(res) {
     if (!res || !res.me || !S.me) return;
     const was = S.me.role;
-    S.me = Object.assign({}, S.me, { id: res.me.id, name: res.me.name, role: res.me.role }, res.me.token ? { token: res.me.token } : {});
+    const hadLogin = S.me.hasLogin;
+    S.me = Object.assign({}, S.me, { id: res.me.id, name: res.me.name, role: res.me.role }, res.me.token ? { token: res.me.token } : {},
+      'hasLogin' in res.me ? { hasLogin: !!res.me.hasLogin, username: res.me.username || '', email: res.me.email || '' } : {});
+    if (S.me.hasLogin) delete S.me.key; // an old code is never needed again
     await DB.setMeta('me', S.me);
     if (was && was !== S.me.role) { S.lastPull = ''; toast('Your role is now: ' + S.me.role); setTimeout(route, 0); }
+    else if (hadLogin !== false && S.me.hasLogin === false && currentView !== 'editor' && currentView !== 'day') setTimeout(route, 0);
   }
 
   async function applyTeam(res) {
@@ -740,7 +744,7 @@
   function syncInfo() {
     const p = pendingCount();
     if (CFG.demo) return { cls: '', text: 'Demo' };
-    if (!apiUrl() || !S.me || !S.me.key) return { cls: 'err', text: 'Not connected' };
+    if (!apiUrl() || !S.me || !(S.me.token || S.me.key)) return { cls: 'err', text: 'Not connected' };
     if (S.sync.state === 'badkey') return { cls: 'err', text: 'Code rejected' };
     if (S.sync.state === 'busy') return { cls: 'busy', text: p ? 'Uploading ' + p : 'Syncing' };
     if (navigator.onLine === false || S.sync.state === 'offline') return { cls: 'wait', text: p ? 'Offline · ' + p : 'Offline' };
@@ -763,8 +767,10 @@
   function route() {
     const h = decodeURIComponent(location.hash.replace(/^#/, ''));
     if (updateReady && h.indexOf('survey-') !== 0 && h.indexOf('day-') !== 0) { restartForUpdate(); return; }
-    const ready = S.me && S.me.name && !S.needLogin && (CFG.demo || (S.me.key && apiUrl()));
+    const ready = S.me && S.me.name && !S.needLogin && (CFG.demo || ((S.me.token || S.me.key) && apiUrl()));
     if (!ready || (S.invite && S.invite.code)) { renderWelcome(); return; }
+    // phones from before 1.7 (and first-time admin codes): choose a username and password once
+    if (S.me.hasLogin === false && !CFG.demo && navigator.onLine !== false && h.indexOf('survey-') !== 0) { renderSetLogin(); return; }
     if (h.indexOf('survey-') === 0) {
       const id = h.slice(7);
       if (S.surveys.has(id)) { renderEditor(id); return; }
@@ -782,13 +788,13 @@
     if (h === 'days' && isMgr()) { renderDays(); return; }
     if (h === 'mine' && isLeader()) { renderMine(); return; }
     if (h === 'dash') { renderDash(); return; }
-    if (h === 'users' && isAdmin()) { renderUsers(); return; }
+    if (h === 'users' && isMgr()) { renderUsers(); return; }
     if (h === 'rules') { renderRules(); return; }
     if (h === 'me') { renderMe(); return; }
     renderList();
   }
 
-  /** Everyone: Surveys + Dashboard. Team leaders: + My houses. Managers: + Implementation days. Admins: + Users. */
+  /** Everyone: Surveys + Dashboard. Team leaders: + My houses. Managers: + Implementation days + Users. */
   function navTabs(active) {
     if (isWaiting()) return '';
     const waitingN = isAdmin() ? S.users.filter((u) => u.pending).length : 0;
@@ -796,7 +802,7 @@
       .concat(isLeader() ? [['mine', 'My houses']] : [])
       .concat(isMgr() ? [['days', 'Implementation days']] : [])
       .concat([['dash', 'Dashboard']])
-      .concat(isAdmin() ? [['users', 'Users' + (waitingN ? ' <span class="badge">' + waitingN + '</span>' : '')]] : []);
+      .concat(isMgr() ? [['users', 'Users' + (waitingN ? ' <span class="badge">' + waitingN + '</span>' : '')]] : []);
     return '<nav class="tabs" aria-label="Sections">' + tabs.map((t) =>
       '<button class="tab" data-go="' + t[0] + '"' + (active === t[0] ? ' aria-current="page"' : '') + '>' + (t[1].indexOf('<span') > 0 ? t[1] : esc(t[1])) + '</button>').join('') + '</nav>';
   }
@@ -858,67 +864,226 @@
     return '<div class="notice info install">' + body + '</div>';
   }
 
+  /* ── Accounts: log in, new account, forgot password ───────────────────────── */
+  const USERNAME_RE = /^[a-z0-9][a-z0-9._-]{2,29}$/;
+  const normUser = (v) => String(v == null ? '' : v).trim().toLowerCase();
+  const COMMON_PASSWORDS = ['12345678', '123456789', '1234567890', '87654321', '11111111', '00000000', '12341234', '11223344', '123123123',
+    'password', 'password1', 'password123', 'passw0rd', 'qwertyuiop', 'qwerty123', 'asdfghjk', 'abcd1234', 'a1234567', 'iloveyou',
+    'shelter2027', 'shelter-2027', 'lebaladna', 'lebaladna1', 'begad123', '01234567', '1q2w3e4r', 'zxcvbnm1'];
+  /** The password is stretched here (PBKDF2-SHA256, 600,000 rounds); the sheet never sees it. */
+  async function stretch(username, password) {
+    if (!window.crypto || !crypto.subtle) throw Object.assign(new Error('Open the app from its https link to log in.'), { code: 'no_crypto' });
+    const enc = new TextEncoder();
+    const key = await crypto.subtle.importKey('raw', enc.encode(String(password).normalize('NFKC')), 'PBKDF2', false, ['deriveBits']);
+    const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: enc.encode('shelter-surveys:' + normUser(username)), iterations: 600000 }, key, 256);
+    return Array.from(new Uint8Array(bits)).map((b) => b.toString(16).padStart(2, '0')).join('');
+  }
+  function passwordProblem(pass, again, username) {
+    if (pass.length < 8) return 'The password needs at least 8 characters.';
+    if (pass.length > 200) return 'That password is too long.';
+    const low = pass.toLowerCase();
+    if (COMMON_PASSWORDS.indexOf(low) >= 0 || /^(.)\1+$/.test(pass) || /^\d{8}$/.test(pass) && '0123456789012345678'.indexOf(pass) >= 0) return 'That password is too easy to guess. Choose another.';
+    const un = normUser(username);
+    if (un && (low === un || (un.length >= 3 && low.indexOf(un) >= 0 && low.split(un).join('').replace(/[^a-z0-9\u0600-\u06ff]/g, '').replace(/^(\d{0,7})$/, '').length < 6))) return 'That is too close to your username. Choose another password.';
+    if (again != null && pass !== again) return 'The two passwords are not the same.';
+    return '';
+  }
+  const usernameProblem = (u) => (USERNAME_RE.test(u) ? '' : 'Username: 3 to 30 English letters or numbers (. _ - allowed), starting with a letter or number.');
+  /** A username to suggest from a name written in English letters ("Ahmed Saad" → "ahmed.saad"). */
+  function suggestUsername(name) {
+    const u = String(name || '').toLowerCase().normalize('NFKD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9]+/g, '.').replace(/^\.+|\.+$/g, '').slice(0, 30);
+    return USERNAME_RE.test(u) ? u : '';
+  }
+  function pwField(id, label, autocomplete, hint) {
+    return '<label class="field wide"><span>' + esc(label) + '</span><span class="code-row"><input type="password" id="' + id + '" autocomplete="' + autocomplete + '" autocapitalize="off" spellcheck="false">' +
+      '<button type="button" class="btn quiet sm" data-act="show-pw" data-for="' + id + '">Show</button></span>' + (hint ? '<small>' + hint + '</small>' : '') + '</label>';
+  }
+  const loginLink = () => cleanApi((($('#w-api') && $('#w-api').value.trim()) || '') || CFG.apiUrl || (S.invite && S.invite.api) || (S.me && S.me.api) || '');
+  const loginError = (err) => ({
+    wrong_login: 'Wrong username or password.',
+    offline: 'No internet. Logging in needs internet once; after that the app works offline.',
+    bad_key: 'That team code is not accepted. Check the invite link or ask a manager.'
+  })[err.code] || err.message || 'Something went wrong.';
+
+  /** Logged in: keep who we are on this phone. A different person than before downloads everything again. */
+  async function finishLogin(res, link) {
+    const before = S.me || {};
+    await applyConfig(res);
+    S.me = { deviceId: before.deviceId || uid(), api: link || before.api || '', id: res.me.id, token: res.me.token || before.token || '',
+      name: res.me.name, role: res.me.role, username: res.me.username || '', email: res.me.email || '', hasLogin: res.me.hasLogin !== false };
+    if (res.me.hasLogin === false && before.key) S.me.key = before.key;
+    if (!before.id || before.id !== S.me.id) {
+      S.lastPull = ''; await DB.setMeta('lastPull', '');
+      S.tasks = []; S.users = []; S.leaders = [];
+    }
+    await DB.setMeta('me', S.me);
+    S.invite = null; S.needLogin = ''; S.welcome = null;
+    S.sync = { state: 'idle', msg: '' };
+    toast(isWaiting() ? 'Welcome, ' + S.me.name + '!' : 'Welcome, ' + S.me.name + ' (' + S.me.role + ')');
+    go('');
+    scheduleSync(300);
+  }
+
   function renderWelcome() {
     currentView = 'welcome';
     const inv = S.invite || {};
     const me = S.me || {};
-    const needApi = !CFG.apiUrl && !inv.api;
+    if (!S.welcome) S.welcome = { mode: inv.code && !S.needLogin ? 'signup' : 'login' };
+    const mode = S.welcome.mode;
+    const needApi = !CFG.apiUrl && !inv.api && !me.api;
+    const apiField = '<label class="field wide"' + (needApi ? '' : ' hidden') + '><span>Sheet connection link</span><input type="url" id="w-api" inputmode="url" autocapitalize="off" value="' + esc(inv.api || me.api || '') + '" placeholder="https://script.google.com/macros/s/…/exec"><small>Only needed if you did not get an invite link.</small></label>';
+    const userField = (label, hint) => '<label class="field wide"><span>' + label + '</span><input type="text" id="w-user" autocomplete="username" autocapitalize="off" spellcheck="false" value="' + esc(S.welcome.username || me.username || '') + '">' + (hint ? '<small>' + hint + '</small>' : '') + '</label>';
+    const links = (list) => '<div class="wlinks">' + list.map((x) => '<button type="button" class="linkbtn" data-wmode="' + x[0] + '">' + esc(x[1]) + '</button>').join('') + '</div>';
+    let body = '';
+    if (mode === 'signup') {
+      body = '<form class="panel" id="signupForm" novalidate><div class="panel-head"><h2>New account</h2></div><div class="fields">' +
+        '<label class="field wide"><span>Your name</span><input type="text" id="w-name" dir="auto" autocomplete="name" value="' + esc(S.welcome.name || '') + '"><small>Full name, the way the team knows you. It goes on every survey you make or change.</small></label>' +
+        userField('Username', 'English letters or numbers, e.g. <span class="data">ahmed.saad</span>. You log in with it on any phone.') +
+        pwField('w-pass', 'Password', 'new-password', 'At least 8 characters. A short sentence is easy to remember.') +
+        pwField('w-pass2', 'Password again', 'new-password', '') +
+        '<label class="field wide"><span>Email <span class="muted">(optional)</span></span><input type="email" id="w-email" autocomplete="email" autocapitalize="off" inputmode="email"><small>To get a code if you forget your password. Without it, a manager makes the code for you.</small></label>' +
+        '<label class="field wide"' + (inv.code ? ' hidden' : '') + '><span>Team code</span><input type="text" id="w-team" autocapitalize="off" autocomplete="off" value="' + esc(inv.code || '') + '"><small>From the invite link or a manager.</small></label>' +
+        apiField + '</div><div id="w-msg"></div>' +
+        '<div class="btn-row"><button class="btn" type="submit" id="w-go">Make my account</button></div></form>' +
+        links([['login', 'I already have an account: log in']]);
+    } else if (mode === 'forgot') {
+      body = '<form class="panel" id="forgotForm" novalidate><div class="panel-head"><h2>Forgot password</h2></div>' +
+        '<p class="small muted" style="margin:0">Get a 6-digit code by email (if your account has one), or ask a manager: they make a code for you in <b>Users</b> and send it on WhatsApp.</p>' +
+        '<div class="fields">' + userField('Username', '') + '</div>' +
+        '<div class="btn-row"><button type="button" class="btn ghost" data-act="email-code">Email me a code</button></div><div id="w-mailmsg"></div>' +
+        '<div class="fields">' +
+        '<label class="field wide"><span>Code</span><input type="text" id="w-code" class="data" inputmode="numeric" autocomplete="one-time-code" maxlength="7" placeholder="123456"></label>' +
+        pwField('w-pass', 'New password', 'new-password', 'At least 8 characters.') +
+        pwField('w-pass2', 'New password again', 'new-password', '') +
+        apiField + '</div><div id="w-msg"></div>' +
+        '<div class="btn-row"><button class="btn" type="submit" id="w-go">Save new password</button></div>' +
+        '<p class="small muted" style="margin:0">This logs you out on your other phones.</p></form>' +
+        links([['login', 'Back to log in']]);
+    } else if (mode === 'admin') {
+      body = '<form class="panel" id="adminForm" novalidate><div class="panel-head"><h2>First-time admin code</h2></div>' +
+        '<p class="small muted" style="margin:0">Only for Begad and Hawary, once: the code from the sheet\'s setup. Next you choose your username and password.</p>' +
+        '<div class="fields"><label class="field wide"><span>Admin code</span><input type="text" id="w-key" class="data" autocapitalize="off" autocomplete="off"></label>' + apiField + '</div>' +
+        '<div id="w-msg"></div><div class="btn-row"><button class="btn" type="submit" id="w-go">Continue</button></div></form>' +
+        links([['login', 'Back to log in']]);
+    } else {
+      body = '<form class="panel" id="loginForm" novalidate><div class="panel-head"><h2>Log in</h2></div><div class="fields">' +
+        userField('Username', '') + pwField('w-pass', 'Password', 'current-password', '') + apiField + '</div>' +
+        '<div id="w-msg"></div><div class="btn-row"><button class="btn" type="submit" id="w-go">Log in</button></div>' +
+        '<p class="small muted" style="margin:0">Logging in needs internet once. After that the app works offline.</p></form>' +
+        links([['signup', 'New here? Make an account'], ['forgot', 'Forgot password?'], ['admin', 'Admin first-time code']]);
+    }
     app().innerHTML =
       '<main class="page"><div class="welcome">' +
       '<div class="logos"><img src="' + esc(ASSET.shelterLogo) + '" alt="Shelter team"><img src="' + esc(ASSET.lebaladnaLogo) + '" alt="Lebaladna"></div>' +
       '<div><span class="eyebrow muted small">Lebaladna · Shelter team</span><h1>Shelter Surveys</h1><p class="muted">Record each house, its rooms and papers. Works without internet and uploads to the team sheet when you are back online.</p></div>' +
       (S.needLogin ? '<div class="notice warn"><div>' + esc(S.needLogin) + '</div></div>' : '') +
-      installHelp(false) +
-      '<form class="panel" id="welcomeForm" novalidate>' +
-      '<div class="fields">' +
-      '<label class="field wide"><span>Your name</span><input type="text" id="w-name" dir="auto" autocomplete="name" value="' + esc(me.name || '') + '" required><small>Full name, the way the team knows you. It goes on every survey you make or change.</small></label>' +
-      '<label class="field wide"><span>Code</span><input type="text" id="w-key" autocapitalize="off" autocomplete="off" value="' + esc(inv.code || (S.needLogin ? '' : me.key) || '') + '" required><small>The team code. (Admins: your own code.)</small></label>' +
-      '<label class="field wide"' + (needApi ? '' : ' hidden') + '><span>Sheet connection link</span><input type="url" id="w-api" inputmode="url" autocapitalize="off" value="' + esc(inv.api || me.api || '') + '" placeholder="https://script.google.com/macros/s/…/exec"><small>Only needed if you did not get an invite link.</small></label>' +
-      '</div>' +
-      '<div id="w-msg"></div>' +
-      '<div class="btn-row"><button class="btn" type="submit" id="w-go">Log in</button></div>' +
-      '<p class="small muted" style="margin:0">The first log-in needs internet. After that the app works offline.</p>' +
-      '</form></div></main>';
-    $('#welcomeForm').addEventListener('submit', async (e) => {
+      body + installHelp(false) + '</div></main>';
+    const msg = (html, kind) => { $('#w-msg').innerHTML = html ? '<div class="notice ' + (kind || 'err') + '"><div>' + html + '</div></div>' : ''; };
+    const busy = (on, text) => { $('#w-go').disabled = on; if (on) msg(esc(text || 'Checking…'), 'info'); };
+    const keep = () => { const u = $('#w-user'); if (u) S.welcome.username = u.value; const n = $('#w-name'); if (n) S.welcome.name = n.value; };
+    $$('[data-wmode]').forEach((b) => b.addEventListener('click', () => { keep(); S.welcome.mode = b.dataset.wmode; renderWelcome(); }));
+    const form = $('form.panel');
+    form.addEventListener('submit', async (e) => {
       e.preventDefault();
-      const name = $('#w-name').value.replace(/\s+/g, ' ').trim();
-      const key = $('#w-key').value.trim();
-      const link = cleanApi($('#w-api').value.trim() || CFG.apiUrl || '');
-      const msg = $('#w-msg');
-      $('#w-name').classList.toggle('bad', name.length < 2);
-      $('#w-key').classList.toggle('bad', !key);
-      if (name.length < 2 || !key) { msg.innerHTML = '<div class="notice err">Type your name and the code.</div>'; return; }
-      if (!link) { msg.innerHTML = '<div class="notice err">Paste the sheet connection link from your invite.</div>'; return; }
-      const before = S.me;
-      const samePerson = before && before.id && before.token && normName(before.name) === normName(name);
-      // a different name on this phone = a different person: they join as themselves
-      S.me = Object.assign({ deviceId: uid() }, before || {}, { name, key, api: link }, samePerson ? {} : { id: '', token: '', role: '' });
-      $('#w-go').disabled = true;
-      msg.innerHTML = '<div class="notice info">Checking the code…</div>';
+      keep();
+      const link = loginLink();
+      if (!link) { msg('Paste the sheet connection link from your invite.'); return; }
       try {
-        const res = await api('ping', {}, 30000);
-        await applyConfig(res);
-        S.me = Object.assign({}, S.me, { id: res.me.id, name: res.me.name, role: res.me.role }, res.me.token ? { token: res.me.token } : {});
-        if (!before || !before.id || before.id !== S.me.id) { // first log-in, or a different person on this phone: download everything again
-          S.lastPull = ''; await DB.setMeta('lastPull', '');
-          S.tasks = []; S.users = []; S.leaders = [];
+        if (mode === 'login') {
+          const username = normUser($('#w-user').value), password = $('#w-pass').value;
+          if (!username || !password) { msg('Type your username and password.'); return; }
+          busy(true, 'Checking…');
+          const pass = await stretch(username, password);
+          await finishLogin(await api('login', { username, pass }, 45000, { url: link }), link);
+        } else if (mode === 'signup') {
+          const name = $('#w-name').value.replace(/\s+/g, ' ').trim(), username = normUser($('#w-user').value), password = $('#w-pass').value;
+          const email = $('#w-email').value.trim(), teamCode = $('#w-team').value.trim();
+          const problem = name.length < 2 ? 'Type your full name.' : usernameProblem(username) || passwordProblem(password, $('#w-pass2').value, username) ||
+            (email && !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email) ? 'That email address doesn\'t look right.' : '') || (teamCode ? '' : 'Type the team code.');
+          if (problem) { msg(esc(problem)); return; }
+          busy(true, 'Making your account…');
+          const pass = await stretch(username, password);
+          await finishLogin(await api('signup', { name, username, pass, email, teamCode }, 45000, { url: link }), link);
+        } else if (mode === 'forgot') {
+          const username = normUser($('#w-user').value), code = $('#w-code').value.replace(/\D/g, ''), password = $('#w-pass').value;
+          const problem = !username ? 'Type your username.' : code.length !== 6 ? 'Type the 6-digit code.' : passwordProblem(password, $('#w-pass2').value, username);
+          if (problem) { msg(esc(problem)); return; }
+          busy(true, 'Saving…');
+          const pass = await stretch(username, password);
+          await finishLogin(await api('resetPassword', { username, code, pass }, 45000, { url: link }), link);
+          toast('New password saved', 3000);
+        } else if (mode === 'admin') {
+          const key = $('#w-key').value.trim();
+          if (!key) { msg('Type the admin code.'); return; }
+          busy(true, 'Checking the code…');
+          const before = S.me;
+          S.me = Object.assign({ deviceId: (before && before.deviceId) || uid() }, { api: link, key, name: '', id: '', token: '' });
+          let res;
+          try { res = await api('ping', {}, 30000); } catch (err) { S.me = before; throw err; }
+          S.me = Object.assign({}, S.me, { name: res.me.name });
+          await finishLogin(res, link);
         }
-        await applyTeam(res);
       } catch (err) {
-        S.me = before;
         $('#w-go').disabled = false;
-        if (err.code === 'bad_key') { msg.innerHTML = '<div class="notice err">That code is not accepted. Check the team code.</div>'; return; }
-        if (err.code === 'offline') { msg.innerHTML = '<div class="notice err">No internet. The first log-in needs internet once.</div>'; return; }
-        msg.innerHTML = '<div class="notice err">' + esc(err.message) + '</div>';
-        return;
+        msg(esc(loginError(err)));
       }
-      await DB.setMeta('me', S.me);
-      S.invite = null;
-      S.needLogin = '';
-      S.sync = { state: 'idle', msg: '' };
-      toast(isWaiting() ? 'Welcome, ' + S.me.name + '!' : 'Welcome, ' + S.me.name + ' (' + S.me.role + ')');
-      go('');
-      scheduleSync(300);
+    });
+    const emailBtn = $('[data-act="email-code"]');
+    if (emailBtn) emailBtn.addEventListener('click', async () => {
+      keep();
+      const username = normUser($('#w-user').value), link = loginLink();
+      if (!username) { msg('Type your username first.'); return; }
+      if (!link) { msg('Paste the sheet connection link from your invite.'); return; }
+      emailBtn.disabled = true;
+      try {
+        const res = await api('resetRequest', { username }, 45000, { url: link });
+        $('#w-mailmsg').innerHTML = '<div class="notice info small"><div>' + esc(res.message) + '</div></div>';
+        $('#w-code').focus();
+      } catch (err) { $('#w-mailmsg').innerHTML = '<div class="notice err small"><div>' + esc(loginError(err)) + '</div></div>'; }
+      emailBtn.disabled = false;
+    });
+  }
+
+  /** Phones from before 1.7 (and the first-time admin code): choose a username and password, same account. */
+  function renderSetLogin() {
+    currentView = 'setlogin';
+    S.cur = null;
+    const suggestion = S.me.username || suggestUsername(S.me.name);
+    app().innerHTML = appbar({ eyebrow: 'Lebaladna · Shelter', title: 'Your log-in', actions: '' }) +
+      '<main class="page"><div class="page-inner">' +
+      '<form class="panel" id="setLoginForm" novalidate><div class="panel-head"><h2 dir="auto">Hi ' + esc(S.me.name || '') + '!</h2></div>' +
+      '<p style="margin:0">The app now uses a <b>username and password</b>, so you can log in on any phone and keep your surveys, role and team. Choose them once. Your surveys stay as they are.</p>' +
+      '<div class="fields">' +
+      '<label class="field wide"><span>Username</span><input type="text" id="l-user" autocomplete="username" autocapitalize="off" spellcheck="false" value="' + esc(suggestion) + '"><small>English letters or numbers, e.g. <span class="data">ahmed.saad</span>.</small></label>' +
+      pwField('l-pass', 'Password', 'new-password', 'At least 8 characters. A short sentence is easy to remember.') +
+      pwField('l-pass2', 'Password again', 'new-password', '') +
+      '<label class="field wide"><span>Email <span class="muted">(optional)</span></span><input type="email" id="l-email" autocomplete="email" autocapitalize="off" inputmode="email" value="' + esc(S.me.email || '') + '"><small>To get a code if you forget your password.</small></label>' +
+      '</div><div id="l-msg"></div>' +
+      '<div class="btn-row"><button class="btn" type="submit" id="l-go">Save</button></div></form>' +
+      '<div class="wlinks"><button type="button" class="linkbtn" data-act="logout">Not you? Log out</button></div>' +
+      '</div></main>';
+    const msg = (html, kind) => { $('#l-msg').innerHTML = html ? '<div class="notice ' + (kind || 'err') + '"><div>' + html + '</div></div>' : ''; };
+    $('#setLoginForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const username = normUser($('#l-user').value), password = $('#l-pass').value, email = $('#l-email').value.trim();
+      const problem = usernameProblem(username) || passwordProblem(password, $('#l-pass2').value, username) ||
+        (email && !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email) ? 'That email address doesn\'t look right.' : '');
+      if (problem) { msg(esc(problem)); return; }
+      $('#l-go').disabled = true;
+      msg('Saving…', 'info');
+      try {
+        const pass = await stretch(username, password);
+        const res = await api('setLogin', { username, pass, email }, 45000);
+        S.me = Object.assign({}, S.me, { token: res.me.token, username: res.me.username, email: res.me.email || '', hasLogin: true });
+        delete S.me.key;
+        await DB.setMeta('me', S.me);
+        toast('Saved. From now on you log in with ' + S.me.username + '.', 4000);
+        go('');
+        scheduleSync(300);
+      } catch (err) {
+        $('#l-go').disabled = false;
+        msg(esc(err.code === 'offline' ? 'No internet. Try again when you have signal; you can keep working meanwhile.' : err.message));
+      }
     });
   }
 
@@ -1878,10 +2043,18 @@
       '<main class="page"><div class="page-inner">' +
       '<section class="panel"><div class="panel-head"><h2>You</h2><span class="status st-Submitted">' + esc(role()) + '</span></div>' +
       '<div class="me-line"><b dir="auto">' + esc(S.me.name || '') + '</b><span class="small muted">' + esc(roleHelp(role())) + '</span></div>' +
-      '<p class="small muted" style="margin:0">' + (isAdmin() ? 'You log in with your own admin code. Change it in Users → your name.' : 'Your role is set by the admins (Begad and Hawary). It changes on this phone at the next sync.') + '</p>' +
+      (S.me.username ? '<div class="small">Username: <b class="data">' + esc(S.me.username) + '</b></div>' : '') +
+      '<p class="small muted" style="margin:0">' + (isAdmin() ? 'Roles are changed in Users.' : 'Your role is set by the admins (Begad and Hawary). It changes on this phone at the next sync.') + '</p>' +
       (CFG.demo ? '' : '<div class="btn-row"><button class="btn ghost" data-act="logout">Log out</button></div>' +
         '<p class="small muted" style="margin:0">Use this when another person takes over this phone. Surveys stay on the phone.' + (p ? ' <b>' + p + ' item(s) are not uploaded yet: sync first, or they upload under the next person\'s name.</b>' : '') + '</p>') +
       '</section>' +
+      (S.me.hasLogin && !CFG.demo ? '<form class="panel" id="pwForm" novalidate><div class="panel-head"><h2>Change password</h2></div><div class="fields">' +
+        pwField('p-old', 'Current password', 'current-password', '') + pwField('p-new', 'New password', 'new-password', 'At least 8 characters.') + pwField('p-new2', 'New password again', 'new-password', '') +
+        '</div><div id="p-msg"></div><div class="btn-row"><button class="btn ghost" type="submit">Change password</button></div>' +
+        '<p class="small muted" style="margin:0">This logs you out on your other phones.</p></form>' +
+        '<form class="panel" id="emailForm" novalidate><div class="panel-head"><h2>Email for "Forgot password"</h2></div><div class="fields">' +
+        '<label class="field wide"><span>Email</span><input type="email" id="e-email" autocomplete="email" autocapitalize="off" inputmode="email" value="' + esc(S.me.email || '') + '"><small>A code comes here if you forget your password. Leave it empty if you don\'t want this.</small></label>' +
+        '</div><div class="btn-row"><button class="btn ghost" type="submit">Save email</button></div></form>' : '') +
       (CFG.demo ? '' : '<form class="panel" id="meForm" novalidate><div class="panel-head"><h2>Connection</h2></div><div class="fields">' +
         (CFG.apiUrl
           ? '<label class="field wide"><span>Sheet connection link</span><input type="url" id="m-api" readonly value="' + esc(apiUrl()) + '"><small>Set for the whole team in config.js on the website.</small></label>'
@@ -1892,7 +2065,7 @@
       (S.sync.msg ? '<div class="notice ' + (S.sync.state === 'offline' ? 'warn' : 'err') + ' small"><div>' + esc(S.sync.msg) + '</div></div>' : '') +
       '<div class="btn-row"><button class="btn ghost" data-act="sync-now">Sync now</button></div></section>' +
       (isMgr() && !CFG.demo ? '<section class="panel"><div class="panel-head"><h2>Invite people</h2></div>' +
-        '<p class="small muted" style="margin:0">Send this link in the team WhatsApp group. It opens the app connected to the sheet with the team code filled in; each person only types their name.' + (isAdmin() && S.teamCode ? ' Team code: <b class="data">' + esc(S.teamCode) + '</b>.' : '') + '</p>' +
+        '<p class="small muted" style="margin:0">Send this link in the team WhatsApp group. It opens the app connected to the sheet with the team code filled in; each person makes their own account (name, username, password).' + (S.teamCode ? ' Team code: <b class="data">' + esc(S.teamCode) + '</b>.' : '') + '</p>' +
         '<div class="btn-row"><button class="btn ghost" data-act="copy-invite">Copy invite link</button></div><input type="text" id="inviteText" readonly hidden></section>' : '') +
       (isStandalone() ? '' : '<section class="panel"><div class="panel-head"><h2>Install</h2></div>' + installHelp(false) + '</section>') +
       '<section class="panel"><div class="panel-head"><h2>Reset this phone</h2></div>' +
@@ -1900,6 +2073,33 @@
       '<div class="btn-row"><button class="btn danger" data-act="reset">Reset this phone</button></div>' +
       '<div class="small muted">Shelter Surveys ' + APP_VERSION + '</div></section>' +
       '</div></main>';
+    const pwForm = $('#pwForm');
+    if (pwForm) pwForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const out = (html, kind) => { $('#p-msg').innerHTML = html ? '<div class="notice ' + (kind || 'err') + ' small"><div>' + html + '</div></div>' : ''; };
+      const old = $('#p-old').value, nw = $('#p-new').value;
+      const problem = !old ? 'Type your current password.' : passwordProblem(nw, $('#p-new2').value, S.me.username) || (old === nw ? 'Choose a different password.' : '');
+      if (problem) { out(esc(problem)); return; }
+      out('Saving…', 'info');
+      try {
+        const [oldPass, pass] = [await stretch(S.me.username, old), await stretch(S.me.username, nw)];
+        await api('changePassword', { oldPass, pass }, 45000);
+        pwForm.reset();
+        out('Password changed. Your other phones are logged out.', 'info');
+      } catch (err) { out(esc(err.code === 'offline' ? 'Changing the password needs internet.' : err.message)); }
+    });
+    const emailForm = $('#emailForm');
+    if (emailForm) emailForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const email = $('#e-email').value.trim();
+      if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) { toast('That email address doesn\'t look right.'); return; }
+      try {
+        await api('saveMe', { email }, 30000);
+        S.me = Object.assign({}, S.me, { email });
+        await DB.setMeta('me', S.me);
+        toast(email ? 'Email saved' : 'Email removed');
+      } catch (err) { toast(err.code === 'offline' ? 'Saving the email needs internet.' : err.message); }
+    });
     const form = $('#meForm');
     if (form) form.addEventListener('submit', async (e) => {
       e.preventDefault();
@@ -1915,15 +2115,17 @@
 
   function roleHelp(r) {
     return {
-      Admin: 'Everything, plus changing people\'s roles',
-      Manager: 'Approves houses, plans implementation days, purchase lists',
+      Admin: 'Everything, plus changing people\'s roles and merging double accounts',
+      Manager: 'Approves houses, plans implementation days, purchase lists, makes password codes for the team',
       'Team leader': 'Sees the houses of their implementation days, marks them roofed',
       Researcher: 'Records surveys, and reviews and corrects any survey until it is approved. Deletes only their own.'
     }[r] || '';
   }
 
   async function logout() {
-    S.me = { deviceId: (S.me && S.me.deviceId) || uid(), api: (S.me && S.me.api) || '' };
+    if (S.me && S.me.token && S.me.hasLogin && navigator.onLine !== false && !CFG.demo) { try { await api('logout', {}, 8000); } catch (e) { /* the key ends anyway on this phone */ } }
+    S.me = { deviceId: (S.me && S.me.deviceId) || uid(), api: (S.me && S.me.api) || '', username: (S.me && S.me.username) || '' };
+    S.welcome = { mode: 'login' };
     S.lastPull = ''; S.tasks = []; S.users = []; S.leaders = []; S.needLogin = '';
     await DB.setMeta('me', S.me);
     await DB.setMeta('lastPull', '');
@@ -2495,15 +2697,11 @@
   }
 
   /* ── Users (admins) ───────────────────────── */
-  function randomCode() {
-    const abc = 'abcdefghjkmnpqrstuvwxyz23456789';
-    let out = '';
-    try { crypto.getRandomValues(new Uint8Array(4)).forEach((b) => { out += abc[b % abc.length]; }); }
-    catch (e) { for (let i = 0; i < 4; i++) out += abc[Math.floor(Math.random() * abc.length)]; }
-    return out + '-' + (1000 + Math.floor(Math.random() * 9000));
-  }
 
-  const teamCodeForInvite = () => (isAdmin() ? S.teamCode : (S.me && S.me.key) || '');
+
+  const teamCodeForInvite = () => S.teamCode || '';
+  /** Managers make codes for researchers and team leaders; admins for anyone but themselves. */
+  const canResetFor = (u) => u.id !== S.me.id && (isAdmin() || (isMgr() && (u.role === 'Researcher' || u.role === 'Team leader')));
 
   function renderUsers() {
     currentView = 'users';
@@ -2512,14 +2710,14 @@
     const users = S.users.slice();
     const order = ['Admin', 'Manager', 'Team leader', 'Researcher'];
     const label = { Admin: 'Admins', Manager: 'Managers', 'Team leader': 'Team leaders', Researcher: 'Researchers' };
-    const waiting = users.filter((u) => u.pending).sort((a, b) => String(b.lastSeen).localeCompare(String(a.lastSeen)));
+    const waiting = isAdmin() ? users.filter((u) => u.pending).sort((a, b) => String(b.lastSeen).localeCompare(String(a.lastSeen))) : [];
     const groups = order.map((r) => [r, users.filter((u) => !u.pending && u.role === r).sort((a, b) => (b.active - a.active) || a.name.localeCompare(b.name))]).filter((g) => g[1].length);
-    app().innerHTML = appbar({ eyebrow: 'Lebaladna · Shelter · ' + (S.me.name || '') + ' (Admin)', title: 'Users', wide: true,
+    app().innerHTML = appbar({ eyebrow: 'Lebaladna · Shelter · ' + (S.me.name || '') + ' (' + role() + ')', title: 'Users', wide: true,
       actions: '<button class="iconbtn" data-act="go-me" aria-label="Settings">' + ICON.gear + '</button>' }) +
       '<main class="page wide"><div class="page-inner">' + navTabs('users') +
-      '<div class="notice info small"><div>Everyone logs in with their name and the team code' + (S.teamCode ? ' <b class="data">' + esc(S.teamCode) + '</b>' : '') +
-      '. They appear here the first time and start as Researchers. Tap a person to make them Team leader or Manager, or to set them back.</div></div>' +
-      (navigator.onLine === false ? '<div class="notice warn small"><div>Offline. Changing roles needs internet.</div></div>' : '') +
+      '<div class="notice info small"><div>People make their own account in the app with the team code' + (S.teamCode ? ' <b class="data">' + esc(S.teamCode) + '</b>' : '') +
+      ' and start as Researchers. Tap a person ' + (isAdmin() ? 'to make them Team leader or Manager, to make a password code, or to merge a double account.' : 'who forgot their password to make them a one-time code.') + '</div></div>' +
+      (navigator.onLine === false ? '<div class="notice warn small"><div>Offline. This screen needs internet.</div></div>' : '') +
       (waiting.length ? '<section class="panel wait-panel"><div class="panel-head"><h2>⏳ Waiting to be let in <span class="badge">' + waiting.length + '</span></h2></div>' +
         '<p class="small muted" style="margin:0">They logged in with the team code. Let in only people you know; they then see all surveys, including national IDs.</p>' +
         '<div class="list">' + waiting.map((u) => '<div class="card user-card">' +
@@ -2529,7 +2727,7 @@
       (groups.length ? groups.map((g) => '<h2 class="list-title">' + esc(label[g[0]]) + ' <span class="muted small">' + g[1].length + '</span></h2><div class="list">' +
         g[1].map((u) => '<div class="card user-card' + (u.active ? '' : ' off') + '" role="button" tabindex="0" data-edituser="' + esc(u.id) + '">' +
           '<div class="main"><div class="fam" dir="auto">' + esc(u.name) + (u.id === S.me.id ? ' <span class="muted small">(you)</span>' : '') + '</div>' +
-          '<div class="sub">' + [u.device, u.lastSeen ? 'seen ' + fmtWhen(u.lastSeen) : ''].filter(Boolean).map((x) => '<bdi>' + esc(x) + '</bdi>').join(' · ') + '</div></div>' +
+          '<div class="sub">' + [u.username ? '@' + u.username : 'no username yet', u.device, u.lastSeen ? 'seen ' + fmtWhen(u.lastSeen) : ''].filter(Boolean).map((x) => '<bdi>' + esc(x) + '</bdi>').join(' · ') + '</div></div>' +
           '<div class="side">' + (u.active ? '' : '<span class="status st-Cancelled">Off</span>') + '</div></div>').join('') + '</div>').join('')
         : '<div class="empty"><h2>No one yet</h2><p>People appear here after their first log-in. Open the app with internet to refresh.</p></div>') +
       '</div></main>';
@@ -2551,10 +2749,7 @@
       S.users = res.users || S.users;
       S.leaders = S.users.filter((x) => x.active && x.role === 'Team leader').map((x) => ({ id: x.id, name: x.name }));
       await DB.setMeta('users', S.users); await DB.setMeta('leaders', S.leaders);
-      if (u.id === S.me.id) { // your own admin code or name
-        S.me = Object.assign({}, S.me, change.code ? { key: change.code } : {}, change.name ? { name: change.name } : {});
-        await DB.setMeta('me', S.me);
-      }
+      if (u.id === S.me.id && change.name) { S.me = Object.assign({}, S.me, { name: change.name }); await DB.setMeta('me', S.me); }
       closeSheet();
       toast(okText, 3500);
       route();
@@ -2566,28 +2761,79 @@
 
   function userSheet(u) {
     if (!u) return;
-    const admin = !!u.code || u.personal;
+    const isAdminRow = u.role === 'Admin';
+    const others = S.users.filter((x) => x.id !== u.id && !x.pending).sort((a, b) => a.name.localeCompare(b.name));
     showSheet('<div id="userSheet"><h2 dir="auto">' + esc(u.name) + '</h2>' +
-      '<p class="small muted" style="margin:4px 0 0">' + esc([u.role, u.device, u.lastSeen ? 'seen ' + fmtWhen(u.lastSeen) : ''].filter(Boolean).join(' · ')) + '</p>' +
-      (admin
-        ? '<form id="adminCodeForm" class="fields" novalidate style="margin-top:14px">' +
-          '<label class="field wide"><span>Admin code</span><span class="code-row"><input type="text" id="u-code" class="data" autocapitalize="off" autocomplete="off" value="' + esc(u.code || '') + '"><button type="button" class="btn ghost sm" data-act="gen-code">New code</button></span><small>Private. Not the team code.</small></label>' +
-          '<div class="btn-row field wide"><button class="btn" type="submit">Save code</button></div></form>'
-        : '<div class="role-pick" role="group" aria-label="Role">' + TEAM_ROLES.map((r) =>
-          '<button type="button" class="role-btn' + (u.role === r ? ' on' : '') + '" data-setrole="' + esc(r) + '"' + (u.role === r ? ' aria-pressed="true"' : '') + '><b>' + esc(r) + '</b><span>' + esc(roleHelp(r)) + '</span></button>').join('') + '</div>') +
+      '<p class="small muted" style="margin:4px 0 0">' + esc([u.role, u.username ? '@' + u.username : 'no username yet', u.email || '', u.device, u.lastSeen ? 'seen ' + fmtWhen(u.lastSeen) : ''].filter(Boolean).join(' · ')) + '</p>' +
+      (isAdmin() && !isAdminRow
+        ? '<div class="role-pick" role="group" aria-label="Role">' + TEAM_ROLES.map((r) =>
+          '<button type="button" class="role-btn' + (u.role === r ? ' on' : '') + '" data-setrole="' + esc(r) + '"' + (u.role === r ? ' aria-pressed="true"' : '') + '><b>' + esc(r) + '</b><span>' + esc(roleHelp(r)) + '</span></button>').join('') + '</div>'
+        : '') +
+      (canResetFor(u) ? '<section class="sheet-part"><h3>Forgot their password?</h3>' +
+        '<p class="small muted" style="margin:0">Make a one-time code (24 hours) and send it on WhatsApp. They open the app → Forgot password → type their username, the code and a new password.</p>' +
+        (u.username ? '' : '<label class="field wide"><span>Username for them</span><input type="text" id="u-username" autocapitalize="off" spellcheck="false" value="' + esc(suggestUsername(u.name)) + '"><small>They have none yet (from before 1.7).</small></label>') +
+        '<div class="btn-row"><button type="button" class="btn ghost" data-act="make-code">Make a code</button></div><div id="u-code-out"></div></section>' : '') +
+      (isAdmin() && u.id !== S.me.id && others.length ? '<section class="sheet-part"><h3>Same person twice?</h3>' +
+        '<p class="small muted" style="margin:0">Moves <b dir="auto">' + esc(u.name) + '</b>\'s surveys, team houses, days and photos into the other account, then switches this one off. Their phones keep working as the other account.</p>' +
+        '<label class="field wide"><span>Keep this account</span><select id="u-merge"><option value="">Choose…</option>' + others.map((x) => '<option value="' + esc(x.id) + '">' + esc(x.name + (x.username ? ' (@' + x.username + ')' : '') + ' · ' + x.role) + '</option>').join('') + '</select></label>' +
+        '<div class="btn-row"><button type="button" class="btn ghost" data-act="merge-user">Merge into it</button></div></section>' : '') +
       '<div id="u-msg"></div>' +
-      '<div class="btn-row">' + (u.id === S.me.id ? '' : '<button type="button" class="btn ' + (u.active ? 'danger' : 'ghost') + '" data-setactive="' + (u.active ? '0' : '1') + '">' + (u.active ? 'Switch off' : 'Switch on again') + '</button>') +
+      '<div class="btn-row">' + (isAdmin() && u.id !== S.me.id && !isAdminRow ? '<button type="button" class="btn ' + (u.active ? 'danger' : 'ghost') + '" data-setactive="' + (u.active ? '0' : '1') + '">' + (u.active ? 'Switch off' : 'Switch on again') + '</button>' : '') +
       '<button type="button" class="btn quiet" data-act="close-sheet">Close</button></div>' +
-      (u.active || admin ? '' : '<p class="small muted" style="margin:0">Switched off: this phone can\'t use the app. (Someone who knows the team code can still join again under a new entry; change the team code in the sheet to stop that.)</p>') +
-      '</div>');
+      (u.active ? '' : '<p class="small muted" style="margin:0">Switched off: they can\'t use the app on any phone.</p>') +
+      '<input type="text" id="codeText" readonly hidden></div>');
     S.userEdit = u;
-    const f = $('#adminCodeForm');
-    if (f) f.addEventListener('submit', (e) => {
-      e.preventDefault();
-      const code = $('#u-code').value.trim();
-      if (code.replace(/[\s\-_.]+/g, '').length < 4) { $('#u-msg').innerHTML = '<div class="notice err small"><div>The code needs at least 4 letters or numbers.</div></div>'; return; }
-      saveUserChange(u, { code }, 'Code saved for ' + u.name);
-    });
+  }
+
+  async function makeResetCode(btn) {
+    const u = S.userEdit, out = $('#u-code-out');
+    if (!u || !out) return;
+    const field = $('#u-username');
+    const username = field ? normUser(field.value) : '';
+    if (field && usernameProblem(username)) { out.innerHTML = '<div class="notice err small"><div>' + esc(usernameProblem(username)) + '</div></div>'; return; }
+    btn.disabled = true;
+    try {
+      const res = CFG.demo ? { code: '482913', username: u.username || username, hours: 24, name: u.name } : await api('issueReset', { id: u.id, username }, 30000);
+      if (res.users) { S.users = res.users; DB.setMeta('users', S.users).catch(() => {}); }
+      const text = 'Shelter Surveys – new password\nOpen the app → Log in → Forgot password.\nUsername: ' + res.username + '\nCode: ' + res.code + '\n(works for ' + res.hours + ' hours)\n\nكود كلمة السر: ' + res.code;
+      S.lastCodeText = text;
+      out.innerHTML = '<div class="code-box"><div class="small muted">One-time code for <b dir="auto">' + esc(res.name || u.name) + '</b> · username <b class="data">' + esc(res.username) + '</b> · ' + res.hours + ' hours</div>' +
+        '<div class="big-code data">' + esc(res.code.slice(0, 3) + ' ' + res.code.slice(3)) + '</div>' +
+        '<div class="btn-row"><a class="btn leaf" href="https://wa.me/?text=' + encodeURIComponent(text) + '" target="_blank" rel="noopener noreferrer">Send on WhatsApp</a>' +
+        '<button type="button" class="btn ghost" data-act="copy-code">Copy</button></div></div>';
+      btn.textContent = 'Make a new code';
+    } catch (err) {
+      out.innerHTML = '<div class="notice err small"><div>' + esc(err.code === 'offline' ? 'No internet. Making a code needs internet.' : err.message) + '</div></div>';
+    }
+    btn.disabled = false;
+  }
+
+  async function mergeUserInto(btn) {
+    const u = S.userEdit, sel = $('#u-merge'), msg = $('#u-msg');
+    const into = sel && S.users.find((x) => x.id === sel.value);
+    if (!u || !into) { msg.innerHTML = '<div class="notice err small"><div>Choose the account to keep.</div></div>'; return; }
+    if (!btn.dataset.armed) {
+      btn.dataset.armed = '1';
+      btn.textContent = 'Tap again: move everything of ' + u.name + ' into ' + into.name;
+      setTimeout(() => { if (btn.isConnected) { delete btn.dataset.armed; btn.textContent = 'Merge into it'; } }, 6000);
+      return;
+    }
+    if (CFG.demo) { toast('Merged (preview only)'); closeSheet(); return; }
+    btn.disabled = true;
+    msg.innerHTML = '<div class="notice info small"><div>Merging…</div></div>';
+    try {
+      const res = await api('mergeUser', { from: u.id, into: into.id }, 60000);
+      S.users = res.users || S.users;
+      S.leaders = S.users.filter((x) => x.active && x.role === 'Team leader').map((x) => ({ id: x.id, name: x.name }));
+      await DB.setMeta('users', S.users); await DB.setMeta('leaders', S.leaders);
+      closeSheet();
+      toast('Merged into ' + into.name + ': ' + res.moved.surveys + ' survey(s), ' + res.moved.days + ' day(s), ' + res.moved.photos + ' photo(s) moved', 5000);
+      S.lastPull = ''; scheduleSync(300);
+      route();
+    } catch (err) {
+      btn.disabled = false;
+      msg.innerHTML = '<div class="notice err small"><div>' + esc(err.code === 'offline' ? 'No internet. Merging needs internet.' : err.message) + '</div></div>';
+    }
   }
 
   /* ── History of one survey ───────────────────────── */
@@ -3587,7 +3833,10 @@
         if (task) runExport(actEl.dataset.kind, taskSurveys(task).filter(isMyHouse), { title: task.name + (task.date ? ' · ' + task.date : ''), leader: S.me.name, summary: false });
         break;
       }
-      case 'gen-code': { const c = $('#u-code'); if (c) c.value = randomCode(); break; }
+      case 'show-pw': { const f = document.getElementById(actEl.dataset.for); if (f) { const show = f.type === 'password'; f.type = show ? 'text' : 'password'; actEl.textContent = show ? 'Hide' : 'Show'; } break; }
+      case 'make-code': makeResetCode(actEl); break;
+      case 'copy-code': copyText(S.lastCodeText || '', $('#codeText')); break;
+      case 'merge-user': mergeUserInto(actEl); break;
       case 'logout': {
         if (removeArm.get('logout') || !pendingCount()) { removeArm.delete('logout'); logout(); }
         else {
@@ -3838,7 +4087,7 @@
       DB.setMeta('me', S.me).catch(() => {});
       if (!S.invite.code) { S.invite = null; toast('Connected to the team sheet'); }
     }
-    if (S.invite && S.me && S.me.name && S.me.key) S.invite = null; // already logged in: the invite only fills the link
+    if (S.invite && S.me && S.me.name && (S.me.token || S.me.key)) S.invite = null; // already logged in: the invite only fills the link
     if (CFG.demo && (!S.me || !S.me.role)) {
       S.me = { name: 'Begad (preview)', role: 'Admin', id: 'demo-admin', key: '', api: '', deviceId: uid() };
       DB.setMeta('me', S.me).catch(() => {});
@@ -3847,11 +4096,10 @@
     if (CFG.demo) {
       if (!S.leaders.length) S.leaders = [{ id: 'demo-tl', name: 'Tarek (example)' }];
       if (!S.users.length) S.users = [
-        { id: 'demo-admin', name: 'Begad (preview)', role: 'Admin', code: 'begd-1234', personal: true, active: true, device: 'This device', lastSeen: nowIso() },
-        { id: 'demo-tl', name: 'Tarek (example)', role: 'Team leader', code: '', active: true, device: 'Android phone · Chrome', lastSeen: nowIso() },
-        { id: 'demo-rv', name: 'Ali (example)', role: 'Researcher', code: '', active: true, device: 'Windows PC · Edge', lastSeen: nowIso() },
-        { id: 'demo-rs', name: 'Ahmed (example)', role: 'Researcher', code: '', active: true, device: 'Android phone · Samsung Internet', lastSeen: nowIso() },
-        { id: 'demo-new', name: 'Karim (new)', role: 'Researcher', code: '', active: false, pending: true, device: 'iPhone · Safari', lastSeen: nowIso() }
+        { id: 'demo-admin', name: 'Begad (preview)', username: 'begad', role: 'Admin', active: true, device: 'This device', lastSeen: nowIso() },
+        { id: 'demo-tl', name: 'Tarek (example)', username: 'tarek', role: 'Team leader', active: true, device: 'Android phone · Chrome', lastSeen: nowIso() },
+        { id: 'demo-rv', name: 'Ali (example)', username: 'ali', role: 'Researcher', active: true, device: 'Windows PC · Edge', lastSeen: nowIso() },
+        { id: 'demo-rs', name: 'Ahmed (example)', username: '', role: 'Researcher', active: true, device: 'Android phone · Samsung Internet', lastSeen: nowIso() }
       ];
     }
     window.addEventListener('hashchange', route);
