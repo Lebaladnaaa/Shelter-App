@@ -518,3 +518,24 @@ table.wood .sw { display: inline-block; width: 12px; height: 12px; border-radius
 .sheet-part h3 { margin: 0; font-size: 1rem; }
 .code-box { display: grid; gap: 8px; background: var(--sunk); border-radius: var(--r-sm); padding: 12px 14px; }
 .big-code { font-size: 2.2rem; font-weight: 700; letter-spacing: .12em; text-align: center; padding: 4px 0; }
+
+/* 1.8 – launch */
+.bottombar .btn.big-submit { flex: 1 1 auto; min-height: 56px; font-size: 1.15rem; font-weight: 700; justify-content: center; }
+.draft-banner { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px;
+  background: var(--warn-soft); color: var(--warn); border: 1px solid color-mix(in srgb, var(--warn) 35%, transparent);
+  border-radius: var(--r-sm); padding: 10px 12px; }
+.draft-banner b { color: var(--warn); }
+.room-bad { background: var(--danger-soft); color: var(--danger); border-radius: var(--r-sm); padding: 10px 12px; display: grid; gap: 8px; justify-items: start; font-size: .95rem; }
+.room.needed { outline: 3px solid var(--danger); outline-offset: 2px; }
+.room-notes textarea { min-height: 2.6em; }
+.leave-sheet { display: grid; gap: 12px; text-align: center; }
+.leave-sheet h2 { margin: 0; }
+.btn-stack { display: grid; gap: 10px; }
+.btn-stack .btn { width: 100%; justify-content: center; }
+.walls { display: grid; gap: 8px; border: 1px solid var(--line); border-radius: var(--r-sm); padding: 10px 12px; }
+.walls-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; grid-template-areas: ". t ." "l c r" ". b ."; gap: 8px; align-items: center; }
+.walls-grid label { display: grid; gap: 2px; font-size: .8rem; color: var(--muted); min-width: 0; }
+.walls-grid select { width: 100%; min-width: 0; }
+.wall-t { grid-area: t; } .wall-r { grid-area: r; } .wall-b { grid-area: b; } .wall-l { grid-area: l; }
+.walls-room { grid-area: c; border: 3px solid var(--ink); border-radius: 3px; min-height: 54px; background: var(--sunk); }
+.legend .op-key { width: 16px; height: 5px; border: 0; border-radius: 2px; }

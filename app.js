@@ -13,7 +13,7 @@
     pptx: 'pptxgen.bundle.js',
     qr: 'qrcode.js'
   }, CFG.assets || {});
-  const APP_VERSION = '1.7.0';
+  const APP_VERSION = '1.8.0';
 
   const STATUSES = ['Draft', 'Submitted', 'Reviewed', 'Approved', 'Roofed', 'Cancelled'];
   const ROLES = ['Admin', 'Manager', 'Team leader', 'Researcher']; // researchers also review
@@ -28,7 +28,7 @@
   ];
   const STOCK_LENGTHS = Array.from({ length: 14 }, (_, i) => 210 + i * 30); // 210, 240 … 600 cm
   const DEFAULT_RULES = {
-    beam: STOCK_LENGTHS, plank: STOCK_LENGTHS, allowance: 10,
+    beam: STOCK_LENGTHS, plank: STOCK_LENGTHS, allowance: 10, beamAllowance: 30,
     beamSpacing: 0.6, plankWidth: 0.1, extraBeams: 0, extraPlanks: 0, example: false
   };
   const DEFAULT_PAPERS = [
@@ -135,7 +135,7 @@
   };
 
   /* ═════════════════════ Wood calculation (same rules as the sheet) ═════════════════════ */
-  /** Rules: the lengths (cm) you can buy; a side needs side + allowance, rounded up to the next length. */
+  /** Rules: the lengths (cm) you can buy; beams need side + beam allowance (30), planks side + allowance (10), rounded up. */
   function normRules(r) {
     r = r || DEFAULT_RULES;
     const lens = (list) => Array.from(new Set((list || []).map((x) => Math.round(typeof x === 'object' && x ? x.buy : x)).filter((n) => n > 0))).sort((a, b) => a - b);
@@ -143,6 +143,7 @@
       beam: lens(r.beam),
       plank: lens(r.plank),
       allowance: r.allowance >= 0 ? Math.round(r.allowance) : 10,
+      beamAllowance: r.beamAllowance >= 0 ? Math.round(r.beamAllowance) : 30,
       beamSpacing: r.beamSpacing > 0 ? r.beamSpacing : 0.6,
       plankWidth: r.plankWidth > 0 ? r.plankWidth : 0.1,
       extraBeams: Math.max(0, Math.round(r.extraBeams || 0)),
@@ -163,8 +164,8 @@
   /**
    * Per roofed room: beams lie along the beam side, one every "beam spacing" across the plank side;
    * planks lie along the plank side, one row every "plank width" across the beam side.
-   * A side over the longest length (with the wall allowance) uses two pieces meeting in the middle:
-   * planks meet on the middle beam (beam count made odd so one sits there); beams meet on a support.
+   * Beams are one piece: a beam side over the longest beam (with its allowance) is INVALID — it must be the plank side.
+   * Planks over the longest length use two pieces meeting on the middle beam (beam count made odd so one sits there).
    */
   function calcWood(rooms, rawRules) {
     const rules = normRules(rawRules);
@@ -181,7 +182,9 @@
       }
       res.roofed++;
       res.roofArea += bs * ps;
-      const bp = piecesFor(rules.beam, bs, rules.allowance);
+      const maxBeam = rules.beam.length ? rules.beam[rules.beam.length - 1] : 0;
+      const bLen = pickLen(rules.beam, bs, rules.beamAllowance);
+      const bp = bLen ? { len: bLen, parts: 1 } : null;
       const pp = piecesFor(rules.plank, ps, rules.allowance);
       row.beamCount = Math.ceil(ps / rules.beamSpacing - 1e-9);
       if (pp && pp.parts === 2 && row.beamCount % 2 === 0) row.beamCount += 1; // a beam in the middle for the plank joint
@@ -190,8 +193,13 @@
         row.beamLen = bp.len; row.beamParts = bp.parts;
         row.beamQty = row.beamCount * bp.parts + rules.extraBeams;
         res.beams[bp.len] = (res.beams[bp.len] || 0) + row.beamQty;
-        if (bp.parts === 2) row.notes.push('beam side ' + fmtM(bs) + ' m is over ' + fmtM(rules.beam[rules.beam.length - 1] / 100) + ' m: 2 beams of ' + bp.len + ' per line, meeting on a support across the middle (support not in the wood list)');
-      } else res.warnings.push(row.name + ': beam side ' + fmtM(bs) + ' m is too long even for 2 beams. Split the room');
+      } else {
+        row.invalid = true;
+        row.bothLong = Math.round(ps * 100) + rules.beamAllowance > maxBeam;
+        res.invalid = (res.invalid || 0) + 1;
+        res.warnings.push(row.name + ': INVALID beam side ' + fmtM(bs) + ' m. Beams can\'t be more than ' + fmtM(maxBeam / 100) + ' m (with ' + rules.beamAllowance +
+          ' cm for the walls). ' + (row.bothLong ? 'Both sides are too long for one beam: split the room.' : 'Make it the plank side (Change beam direction on the plan).'));
+      }
       if (pp) {
         row.plankLen = pp.len; row.plankParts = pp.parts;
         row.plankQty = row.plankRows * pp.parts + rules.extraPlanks;
@@ -410,7 +418,7 @@
     const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
     const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs || 45000) : null;
     const me = S.me || {};
-    const who = anon ? {} : Object.assign({ uid: me.id || '', token: me.token || '' }, me.key && !me.hasLogin ? { key: me.key } : {});
+    const who = anon ? {} : Object.assign({ uid: me.id || '', token: me.token || '', epoch: S.dataEpoch || '' }, me.key && !me.hasLogin ? { key: me.key } : {});
     let res;
     try {
       res = await fetch(anon ? anon.url : apiUrl(), {
@@ -452,6 +460,7 @@
     syncing = true;
     S.sync.state = 'busy';
     updateSyncPill();
+    const cred = (S.me.token || '') + '|' + (S.me.key || ''); // the log-in this sync started with
     try {
       if (!S.me.role || !S.me.id || isWaiting()) await identify(); // first run, or waiting to be let in
       if (isWaiting()) throw Object.assign(new Error('waiting'), { code: 'pending' });
@@ -467,6 +476,14 @@
       DB.setMeta('lastSyncAt', S.lastSyncAt).catch(() => {});
     } catch (e) {
       if (e.code === 'offline') S.sync = { state: 'offline', msg: e.message };
+      else if (e.code === 'data_reset') { // the sheet started fresh: drop this phone's old data, then download again
+        await clearPhoneData();
+        S.sync = { state: 'wait', msg: '' };
+        syncAgain = true;
+      }
+      else if ((e.code === 'bad_key' || e.code === 'need_login') && (!S.me || ((S.me.token || '') + '|' + (S.me.key || '')) !== cred)) {
+        syncAgain = true; // the log-in changed while this sync ran (e.g. the first-time code was just used up): try again with the new one
+      }
       else if (e.code === 'bad_key' || e.code === 'need_login') { // logged out (password changed or reset, or an old code)
         S.me = Object.assign({}, S.me, { token: '', key: '' });
         await DB.setMeta('me', S.me);
@@ -502,7 +519,8 @@
     const o = {};
     keys.forEach((k) => { if (s[k] != null) o[k] = s[k]; });
     if (s.locationCleared && !s.location) o.locationCleared = true;
-    o.rooms = (s.rooms || []).map((r) => ({ id: r.id, name: r.name, grade: r.grade, roof: !!r.roof, beamSide: r.beamSide, plankSide: r.plankSide, color: r.color }));
+    o.rooms = (s.rooms || []).map((r) => ({ id: r.id, name: r.name, grade: r.grade, roof: !!r.roof, beamSide: r.beamSide, plankSide: r.plankSide, color: r.color,
+      notes: r.notes || '', walls: r.walls || {} }));
     o.updatedBy = S.me.name;
     return o;
   }
@@ -585,6 +603,7 @@
       live.locationCleared = false;
       if (res.status && res.status !== live.status) live.status = res.status;
       if (res.needLocation) toast((live.family || 'A survey') + ': save the house location first. It stays a draft until then.', 5000);
+      else if (res.needWood) toast((live.family || 'A survey') + ': a beam side is over 6 m. It stays a draft until it is the plank side.', 5000);
       if (live.updatedAt === sentAt) live.dirty = false;
       await DB.put('surveys', live);
       refreshAfterSync(live, true);
@@ -617,9 +636,31 @@
     }
   }
 
+  /**
+   * The sheet started fresh (Shelter → Start fresh) or moved to a new sheet: the old surveys, papers, days and
+   * photos on this phone go, including anything not uploaded (it belonged to the old data). The log-in stays.
+   */
+  async function clearPhoneData(epoch) {
+    const keep = { me: S.me, config: await DB.meta('config'), teamCode: S.teamCode, users: S.users, leaders: S.leaders };
+    await DB.clear();
+    for (const k of Object.keys(keep)) if (keep[k] != null) await DB.setMeta(k, keep[k]);
+    S.surveys.clear(); S.lastPull = ''; S.tasks = []; S.photos = []; S.pendingPhotos = [];
+    S.pendingDeletes = []; S.pendingStates = []; S.pendingTasks = [];
+    S.dataEpoch = epoch || '';
+    if (epoch) await DB.setMeta('dataEpoch', epoch);
+    toast('The team sheet started fresh: old data cleared from this phone', 5000);
+    if (currentView === 'editor' || currentView === 'list' || currentView === 'mine' || currentView === 'dash') setTimeout(() => go(''), 0);
+  }
+
+  /** Returns true when this phone's old data was just cleared (a full download follows). */
   async function applyConfig(res) {
     const c = res && res.config;
-    if (!c) return;
+    if (!c) return false;
+    let cleared = false;
+    if (c.dataEpoch && c.dataEpoch !== S.dataEpoch) {
+      if (S.dataEpoch) { await clearPhoneData(c.dataEpoch); cleared = true; }
+      else { S.dataEpoch = c.dataEpoch; await DB.setMeta('dataEpoch', c.dataEpoch); } // first time: just remember it
+    }
     const rules = c.rules || {};
     const hasRules = (rules.beam && rules.beam.length) || (rules.plank && rules.plank.length);
     S.config = {
@@ -629,6 +670,7 @@
       updatedAt: res.serverTime || nowIso()
     };
     await DB.setMeta('config', S.config);
+    return cleared;
   }
 
   function keepFocus(fn) {
@@ -682,7 +724,7 @@
 
   async function pull() {
     const res = await api('pull', { since: S.lastPull || '' }, 60000);
-    await applyConfig(res);
+    if (await applyConfig(res) && S.lastPull === '' && !res.full) { await applyMe(res); await applyTeam(res); scheduleSync(300); return; }
     await applyMe(res);
     await applyTeam(res);
     let changedCurrent = false;
@@ -771,6 +813,16 @@
     if (!ready || (S.invite && S.invite.code)) { renderWelcome(); return; }
     // phones from before 1.7 (and first-time admin codes): choose a username and password once
     if (S.me.hasLogin === false && !CFG.demo && navigator.onLine !== false && h.indexOf('survey-') !== 0) { renderSetLogin(); return; }
+    if (currentView === 'editor' && S.cur && h !== 'survey-' + S.cur.id && !S.leaveOk) {
+      const ls = S.surveys.get(S.cur.id);
+      if (worthSubmitting(ls)) { // leaving your own unsubmitted survey: ask first
+        S.leaveTo = h;
+        history.replaceState(null, '', '#survey-' + ls.id);
+        showLeaveSheet(ls);
+        return;
+      }
+    }
+    S.leaveOk = false;
     if (h.indexOf('survey-') === 0) {
       const id = h.slice(7);
       if (S.surveys.has(id)) { renderEditor(id); return; }
@@ -930,25 +982,25 @@
     const me = S.me || {};
     if (!S.welcome) S.welcome = { mode: inv.code && !S.needLogin ? 'signup' : 'login' };
     const mode = S.welcome.mode;
-    const needApi = !CFG.apiUrl && !inv.api && !me.api;
+    const needApi = !CFG.apiUrl && !inv.api && !me.api; // with config.js (the normal case) nobody sees or changes the link
     const apiField = '<label class="field wide"' + (needApi ? '' : ' hidden') + '><span>Sheet connection link</span><input type="url" id="w-api" inputmode="url" autocapitalize="off" value="' + esc(inv.api || me.api || '') + '" placeholder="https://script.google.com/macros/s/…/exec"><small>Only needed if you did not get an invite link.</small></label>';
     const userField = (label, hint) => '<label class="field wide"><span>' + label + '</span><input type="text" id="w-user" autocomplete="username" autocapitalize="off" spellcheck="false" value="' + esc(S.welcome.username || me.username || '') + '">' + (hint ? '<small>' + hint + '</small>' : '') + '</label>';
     const links = (list) => '<div class="wlinks">' + list.map((x) => '<button type="button" class="linkbtn" data-wmode="' + x[0] + '">' + esc(x[1]) + '</button>').join('') + '</div>';
     let body = '';
     if (mode === 'signup') {
       body = '<form class="panel" id="signupForm" novalidate><div class="panel-head"><h2>New account</h2></div><div class="fields">' +
-        '<label class="field wide"><span>Your name</span><input type="text" id="w-name" dir="auto" autocomplete="name" value="' + esc(S.welcome.name || '') + '"><small>Full name, the way the team knows you. It goes on every survey you make or change.</small></label>' +
-        userField('Username', 'English letters or numbers, e.g. <span class="data">ahmed.saad</span>. You log in with it on any phone.') +
-        pwField('w-pass', 'Password', 'new-password', 'At least 8 characters. A short sentence is easy to remember.') +
+        '<label class="field wide"><span>Your name</span><input type="text" id="w-name" dir="auto" autocomplete="name" value="' + esc(S.welcome.name || '') + '"><small>As the team knows you</small></label>' +
+        userField('Username', 'English letters, e.g. <span class="data">ahmed.saad</span>') +
+        pwField('w-pass', 'Password', 'new-password', 'At least 8 characters') +
         pwField('w-pass2', 'Password again', 'new-password', '') +
-        '<label class="field wide"><span>Email <span class="muted">(optional)</span></span><input type="email" id="w-email" autocomplete="email" autocapitalize="off" inputmode="email"><small>To get a code if you forget your password. Without it, a manager makes the code for you.</small></label>' +
-        '<label class="field wide"' + (inv.code ? ' hidden' : '') + '><span>Team code</span><input type="text" id="w-team" autocapitalize="off" autocomplete="off" value="' + esc(inv.code || '') + '"><small>From the invite link or a manager.</small></label>' +
+        '<label class="field wide"><span>Email <span class="muted">(optional)</span></span><input type="email" id="w-email" autocomplete="email" autocapitalize="off" inputmode="email"><small>For a forgotten password</small></label>' +
+        '<label class="field wide"' + (inv.code ? ' hidden' : '') + '><span>Team code</span><input type="text" id="w-team" autocapitalize="off" autocomplete="off" value="' + esc(inv.code || '') + '"></label>' +
         apiField + '</div><div id="w-msg"></div>' +
         '<div class="btn-row"><button class="btn" type="submit" id="w-go">Make my account</button></div></form>' +
         links([['login', 'I already have an account: log in']]);
     } else if (mode === 'forgot') {
       body = '<form class="panel" id="forgotForm" novalidate><div class="panel-head"><h2>Forgot password</h2></div>' +
-        '<p class="small muted" style="margin:0">Get a 6-digit code by email (if your account has one), or ask a manager: they make a code for you in <b>Users</b> and send it on WhatsApp.</p>' +
+        '<p class="small muted" style="margin:0">A code by email, or ask a manager for one.</p>' +
         '<div class="fields">' + userField('Username', '') + '</div>' +
         '<div class="btn-row"><button type="button" class="btn ghost" data-act="email-code">Email me a code</button></div><div id="w-mailmsg"></div>' +
         '<div class="fields">' +
@@ -961,7 +1013,7 @@
         links([['login', 'Back to log in']]);
     } else if (mode === 'admin') {
       body = '<form class="panel" id="adminForm" novalidate><div class="panel-head"><h2>First-time admin code</h2></div>' +
-        '<p class="small muted" style="margin:0">Only for Begad and Hawary, once: the code from the sheet\'s setup. Next you choose your username and password.</p>' +
+        '<p class="small muted" style="margin:0">Admins only, once.</p>' +
         '<div class="fields"><label class="field wide"><span>Admin code</span><input type="text" id="w-key" class="data" autocapitalize="off" autocomplete="off"></label>' + apiField + '</div>' +
         '<div id="w-msg"></div><div class="btn-row"><button class="btn" type="submit" id="w-go">Continue</button></div></form>' +
         links([['login', 'Back to log in']]);
@@ -969,7 +1021,7 @@
       body = '<form class="panel" id="loginForm" novalidate><div class="panel-head"><h2>Log in</h2></div><div class="fields">' +
         userField('Username', '') + pwField('w-pass', 'Password', 'current-password', '') + apiField + '</div>' +
         '<div id="w-msg"></div><div class="btn-row"><button class="btn" type="submit" id="w-go">Log in</button></div>' +
-        '<p class="small muted" style="margin:0">Logging in needs internet once. After that the app works offline.</p></form>' +
+        '</form>' +
         links([['signup', 'New here? Make an account'], ['forgot', 'Forgot password?'], ['admin', 'Admin first-time code']]);
     }
     app().innerHTML =
@@ -1052,12 +1104,12 @@
     app().innerHTML = appbar({ eyebrow: 'Lebaladna · Shelter', title: 'Your log-in', actions: '' }) +
       '<main class="page"><div class="page-inner">' +
       '<form class="panel" id="setLoginForm" novalidate><div class="panel-head"><h2 dir="auto">Hi ' + esc(S.me.name || '') + '!</h2></div>' +
-      '<p style="margin:0">The app now uses a <b>username and password</b>, so you can log in on any phone and keep your surveys, role and team. Choose them once. Your surveys stay as they are.</p>' +
+      '<p style="margin:0">Choose a <b>username and password</b> once. Your surveys and role stay.</p>' +
       '<div class="fields">' +
-      '<label class="field wide"><span>Username</span><input type="text" id="l-user" autocomplete="username" autocapitalize="off" spellcheck="false" value="' + esc(suggestion) + '"><small>English letters or numbers, e.g. <span class="data">ahmed.saad</span>.</small></label>' +
-      pwField('l-pass', 'Password', 'new-password', 'At least 8 characters. A short sentence is easy to remember.') +
+      '<label class="field wide"><span>Username</span><input type="text" id="l-user" autocomplete="username" autocapitalize="off" spellcheck="false" value="' + esc(suggestion) + '"><small>English letters, e.g. <span class="data">ahmed.saad</span></small></label>' +
+      pwField('l-pass', 'Password', 'new-password', 'At least 8 characters') +
       pwField('l-pass2', 'Password again', 'new-password', '') +
-      '<label class="field wide"><span>Email <span class="muted">(optional)</span></span><input type="email" id="l-email" autocomplete="email" autocapitalize="off" inputmode="email" value="' + esc(S.me.email || '') + '"><small>To get a code if you forget your password.</small></label>' +
+      '<label class="field wide"><span>Email <span class="muted">(optional)</span></span><input type="email" id="l-email" autocomplete="email" autocapitalize="off" inputmode="email" value="' + esc(S.me.email || '') + '"><small>For a forgotten password</small></label>' +
       '</div><div id="l-msg"></div>' +
       '<div class="btn-row"><button class="btn" type="submit" id="l-go">Save</button></div></form>' +
       '<div class="wlinks"><button type="button" class="linkbtn" data-act="logout">Not you? Log out</button></div>' +
@@ -1261,13 +1313,15 @@
       '<main class="page"><div class="page-inner">' +
       '<nav class="steps" aria-label="Survey steps">' + steps + '</nav>' +
       (ro ? '<div class="notice info small ro-note"><div>' + esc(whyReadOnly(s)) + '</div></div>' : '') +
+      (isMyDraft(s) ? '<div class="draft-banner" role="status"><span><b>Draft – not submitted.</b> Only you can see it.</span>' +
+        (step !== 4 ? '<button class="btn sm leaf" data-step="4">Go to Submit</button>' : '<span class="small">Tap <b>Submit for review</b> below.</span>') + '</div>' : '') +
       body +
       '</div></main>' +
       '<div class="bottombar"><div class="bottombar-inner">' +
       (prev != null ? '<button class="btn ghost" data-step="' + prev + '">Back</button>' : '<button class="btn ghost" data-act="back">' + backLabel + '</button>') +
-      '<span class="grow"></span>' +
+      (next == null && isMyDraft(s) ? '' : '<span class="grow"></span>') +
       (next != null ? '<button class="btn" data-step="' + next + '">Next: ' + esc(stepLabel(next)) + '</button>'
-        : (s.status || 'Draft') === 'Draft' && canEdit(s) && !isMgr() ? '<button class="btn leaf big-submit" data-act="submit-survey">' + ICON.check + 'Submit for review</button>'
+        : isMyDraft(s) ? '<button class="btn leaf big-submit" data-act="submit-survey">' + ICON.check + 'Submit for review</button>'
           : '<button class="btn leaf" data-act="back">Done</button>') +
       '</div></div>';
     if (step === 0) updateDupWarn(s);
@@ -1376,7 +1430,7 @@
     } else if (ro) {
       inner = '<p class="small muted" style="margin:0">No location saved for this house.</p>';
     } else {
-      inner = '<p class="small muted" style="margin:0"><b>Required.</b> At the house door, tap the button. The team finds the house with it on implementation day, and it prints as a QR code on the PDF.</p>' +
+      inner = '<p class="small muted" style="margin:0"><b>Required.</b> Tap it at the house door.</p>' +
         '<div class="btn-row"><button class="btn ghost" data-act="gps">' + ICON.pin + 'Save house location</button></div>';
     }
     return '<section class="panel" id="locPanel"><div class="panel-head"><h2>House location' + (L ? '' : ' <span class="req">required</span>') + '</h2></div>' + inner + '<div id="gpsMsg"></div></section>';
@@ -1457,10 +1511,13 @@
     return (s.rooms || []).length % ROOM_COLORS.length;
   }
   const measured = (r) => r.beamSide > 0 && r.plankSide > 0;
+  /** The longest beam side that still fits one beam (6 m − 30 cm = 5.70 m). */
+  const maxBeamSide = () => { const nr = normRules(S.config.rules); return ((nr.beam[nr.beam.length - 1] || 600) - nr.beamAllowance) / 100; };
+  const woodInvalid = (s) => !!calcWood(s.rooms, S.config.rules).invalid;
 
   function roomsStep(s, ro) {
     return '<section class="panel"><div class="panel-head"><h2>Rooms</h2><span class="small muted">Sizes in metres · 345 is read as 3.45 m</span></div>' +
-      (ro ? '' : '<div class="notice info small"><div><b>Beam side</b> = the side the beams (عروق) lie along. <b>Plank side</b> = the side the planks (ألواح) lie along. Wood length = side + ' + normRules(S.config.rules).allowance + ' cm, rounded up. You can also change the beam direction on the plan. Rooms that will not get a roof can stay without sizes.</div></div>') +
+      (ro ? '' : '<p class="small muted" style="margin:0"><b>Beam side</b> = where the beams (عروق) lie, at most ' + fmtM(maxBeamSide()) + ' m. <b>Plank side</b> = where the planks (ألواح) lie.</p>') +
       '<fieldset class="ro-set"' + (ro ? ' disabled' : '') + '><div class="rooms" id="rooms">' + (s.rooms.length ? s.rooms.map((r, i) => roomHtml(s, r, i, ro)).join('') : '<p class="muted">No rooms yet.' + (ro ? '' : ' Add the first one below.') + '</p>') + '</div></fieldset>' +
       (ro ? '' : '<div><div class="small muted" style="margin-bottom:6px">Add a room</div><div class="quick">' +
         ROOM_NAMES.map((n) => '<button class="chip" data-addroom="' + esc(n) + '">' + esc(n) + '</button>').join('') +
@@ -1473,7 +1530,12 @@
     const w = calcWood(s.rooms, S.config.rules).rooms[i] || {};
     if (w.missing) return '<div class="room-wood warn">Add both sides to work out the wood.</div>';
     const parts = [];
-    parts.push('<span><span class="lab">Beams</span>' + (w.beamLen ? w.beamLen + ' × ' + w.beamQty : '<span class="warn">too long even for 2 beams</span>') + '</span>');
+    if (w.invalid) {
+      return '<div class="room-bad"><b>Invalid beam side: ' + fmtM(r.beamSide) + ' m.</b> Beams can\'t be more than ' + fmtM(maxBeamSide()) + ' m. ' +
+        (w.bothLong ? 'Both sides are too long: split the room into two.' : 'Make it the plank side.') +
+        (w.bothLong ? '' : ' <button type="button" class="btn sm" data-act="swap-sides">Swap beam and plank sides</button>') + '</div>';
+    }
+    parts.push('<span><span class="lab">Beams</span>' + w.beamLen + ' × ' + w.beamQty + '</span>');
     parts.push('<span><span class="lab">Planks</span>' + (w.plankLen ? w.plankLen + ' × ' + w.plankQty : '<span class="warn">too long even for 2 planks</span>') + '</span>');
     parts.push('<span><span class="lab">Area</span>' + fmtM(r.beamSide * r.plankSide) + ' m²</span>');
     return '<div class="room-wood">' + parts.join('') + '</div>' +
@@ -1491,7 +1553,9 @@
       '<div class="dims">' +
       '<label class="field"><span>Beam side (m)</span><input type="text" inputmode="decimal" data-rf="beamSide" id="rb-' + esc(r.id) + '" value="' + esc(fmtM(r.beamSide)) + '" placeholder="e.g. 3.45" autocomplete="off"></label>' +
       '<label class="field"><span>Plank side (m)</span><input type="text" inputmode="decimal" data-rf="plankSide" id="rp-' + esc(r.id) + '" value="' + esc(fmtM(r.plankSide)) + '" placeholder="e.g. 4" autocomplete="off"></label>' +
-      '</div><div data-wood>' + roomWoodHtml(s, i) + '</div></div>';
+      '</div><div data-wood>' + roomWoodHtml(s, i) + '</div>' +
+      '<label class="field wide room-notes"><span>Notes for this room</span><textarea data-rf="notes" id="rnote-' + esc(r.id) + '" rows="2" dir="auto" maxlength="1000" placeholder="Cracks, a column, roof height…">' + esc(r.notes || '') + '</textarea></label>' +
+      '</div>';
   }
 
   function addRoom(s, name) {
@@ -1518,6 +1582,98 @@
       const sw = $('.swatch', el);
       if (sw) sw.textContent = String(i + 1);
     });
+  }
+
+  /* ── Doors, windows, house entrance (per wall, as drawn on the plan) ───────────────────────── */
+  const WALL_KEYS = ['t', 'r', 'b', 'l'];
+  const WALL_LABEL = { t: 'Top', r: 'Right', b: 'Bottom', l: 'Left' };
+  const WALL_OPTS = [['', 'Nothing'], ['door', 'Door'], ['window', 'Window'], ['both', 'Door + window'], ['entrance', 'House entrance']];
+  /** Turning a room on the plan turns its walls too (clockwise). */
+  function turnWalls(r) {
+    const w = r.walls || {};
+    const n = {};
+    if (w.l) n.t = w.l; if (w.t) n.r = w.t; if (w.r) n.b = w.r; if (w.b) n.l = w.b;
+    r.walls = n;
+  }
+  /** Openings of a room `w` × `h` metres (as drawn): door / window / entrance segments in room metres, with the inward normal. */
+  function openingsOf(r, w, h) {
+    const out = [];
+    const walls = r.walls || {};
+    const lines = { t: [0, 0, w, 0], r: [w, 0, w, h], b: [0, h, w, h], l: [0, 0, 0, h] };
+    const inward = { t: [0, 1], r: [-1, 0], b: [0, -1], l: [1, 0] };
+    WALL_KEYS.forEach((k) => {
+      const v = walls[k];
+      if (!v) return;
+      const [x1, y1, x2, y2] = lines[k];
+      const len = Math.hypot(x2 - x1, y2 - y1);
+      if (!(len > 0)) return;
+      const ux = (x2 - x1) / len, uy = (y2 - y1) / len;
+      const put = (kind, at) => {
+        const size = Math.min(kind === 'window' ? 1.0 : 0.9, len * 0.42);
+        const cx = x1 + (x2 - x1) * at, cy = y1 + (y2 - y1) * at;
+        out.push({ kind, wall: k, size, cx, cy, ux, uy, nx: inward[k][0], ny: inward[k][1],
+          ax: cx - ux * size / 2, ay: cy - uy * size / 2, bx: cx + ux * size / 2, by: cy + uy * size / 2 });
+      };
+      if (v === 'both') { put('door', 0.28); put('window', 0.72); } else put(v, 0.5);
+    });
+    return out;
+  }
+  const OPEN_INK = { door: '#7A4A1E', window: '#1E6FD9', entrance: '#1B7F3A' };
+  function openingsSvg(r, w, h, fill) {
+    return openingsOf(r, w, h).map((o) => {
+      const P = (x) => x * PX;
+      const door = o.kind !== 'window';
+      const ink = OPEN_INK[o.kind];
+      let g = '<line x1="' + P(o.ax) + '" y1="' + P(o.ay) + '" x2="' + P(o.bx) + '" y2="' + P(o.by) + '" style="stroke:' + (door ? fill : ink) + '" stroke-width="' + (door ? 8 : 7) + '" vector-effect="non-scaling-stroke"/>';
+      if (door) { // gap in the wall + the door leaf and its swing
+        const lx = o.ax + o.nx * o.size, ly = o.ay + o.ny * o.size;
+        const sweep = (o.nx * (o.by - o.ay) - o.ny * (o.bx - o.ax)) > 0 ? 1 : 0;
+        g += '<path d="M' + P(o.ax) + ' ' + P(o.ay) + 'L' + P(lx) + ' ' + P(ly) + 'A' + P(o.size) + ' ' + P(o.size) + ' 0 0 ' + sweep + ' ' + P(o.bx) + ' ' + P(o.by) + '" style="fill:none;stroke:' + ink + '" stroke-width="2" vector-effect="non-scaling-stroke"/>';
+      } else {
+        g += '<line x1="' + P(o.ax) + '" y1="' + P(o.ay) + '" x2="' + P(o.bx) + '" y2="' + P(o.by) + '" style="stroke:#FFFFFF" stroke-width="2" vector-effect="non-scaling-stroke"/>';
+      }
+      if (o.kind === 'entrance') { // arrow from outside into the house
+        const tx = o.cx - o.nx * 0.06, ty = o.cy - o.ny * 0.06, bx = o.cx - o.nx * 0.42, by = o.cy - o.ny * 0.42;
+        g += '<path d="M' + P(tx) + ' ' + P(ty) + 'L' + P(bx + o.ux * 0.17) + ' ' + P(by + o.uy * 0.17) + 'L' + P(bx - o.ux * 0.17) + ' ' + P(by - o.uy * 0.17) + 'Z" style="fill:' + ink + '"/>' +
+          '<text x="' + P(o.cx - o.nx * 0.62) + '" y="' + P(o.cy - o.ny * 0.62 + 0.07) + '" text-anchor="middle" style="fill:' + ink + ';font-size:22px;font-weight:700">Entrance</text>';
+      }
+      return g;
+    }).join('');
+  }
+  function drawOpeningsCanvas(ctx, r, x, y, k, w, h, fill) {
+    openingsOf(r, w, h).forEach((o) => {
+      const X = (v) => x + v * k, Y = (v) => y + v * k;
+      const door = o.kind !== 'window';
+      const ink = OPEN_INK[o.kind];
+      ctx.save();
+      ctx.lineCap = 'butt';
+      ctx.strokeStyle = door ? fill : ink; ctx.lineWidth = door ? 12 : 11;
+      ctx.beginPath(); ctx.moveTo(X(o.ax), Y(o.ay)); ctx.lineTo(X(o.bx), Y(o.by)); ctx.stroke();
+      if (door) {
+        const lx = o.ax + o.nx * o.size, ly = o.ay + o.ny * o.size;
+        const a0 = Math.atan2(ly - o.ay, lx - o.ax), a1 = Math.atan2(o.by - o.ay, o.bx - o.ax);
+        const ccw = (o.nx * (o.by - o.ay) - o.ny * (o.bx - o.ax)) <= 0;
+        ctx.strokeStyle = ink; ctx.lineWidth = 3;
+        ctx.beginPath(); ctx.moveTo(X(o.ax), Y(o.ay)); ctx.lineTo(X(lx), Y(ly)); ctx.arc(X(o.ax), Y(o.ay), o.size * k, a0, a1, ccw); ctx.stroke();
+      } else {
+        ctx.strokeStyle = '#FFFFFF'; ctx.lineWidth = 3;
+        ctx.beginPath(); ctx.moveTo(X(o.ax), Y(o.ay)); ctx.lineTo(X(o.bx), Y(o.by)); ctx.stroke();
+      }
+      if (o.kind === 'entrance') {
+        const tx = o.cx - o.nx * 0.06, ty = o.cy - o.ny * 0.06, bx = o.cx - o.nx * 0.42, by = o.cy - o.ny * 0.42;
+        ctx.fillStyle = ink;
+        ctx.beginPath(); ctx.moveTo(X(tx), Y(ty)); ctx.lineTo(X(bx + o.ux * 0.17), Y(by + o.uy * 0.17)); ctx.lineTo(X(bx - o.ux * 0.17), Y(by - o.uy * 0.17)); ctx.closePath(); ctx.fill();
+        setFont(ctx, 26, 700); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillText('Entrance', X(o.cx - o.nx * 0.68), Y(o.cy - o.ny * 0.68));
+      }
+      ctx.restore();
+    });
+  }
+  /** One house entrance: choosing it on a wall turns any other entrance into a plain door. */
+  function setWall(s, r, k, v) {
+    if (v === 'entrance') s.rooms.forEach((o) => WALL_KEYS.forEach((kk) => { if (o.walls && o.walls[kk] === 'entrance' && !(o === r && kk === k)) o.walls[kk] = 'door'; }));
+    r.walls = Object.assign({}, r.walls || {});
+    if (v) r.walls[k] = v; else delete r.walls[k];
   }
 
   /* ── Plan (drag & snap) ───────────────────────── */
@@ -1596,9 +1752,14 @@
         '<button class="btn ghost sm" data-act="tidy">Line up rooms</button>') +
       '<button class="btn ghost sm" data-act="export" data-kind="png">' + ICON.download + 'Save drawing</button></div>' +
       '<div class="plan-wrap"><svg id="plan"' + (ro ? ' class="ro"' : '') + ' xmlns="http://www.w3.org/2000/svg" role="img" aria-label="House plan"></svg></div>' +
-      '<div class="legend"><span><i style="background:#F4A817"></i>Gets a new roof</span><span><i style="background:transparent;border-color:var(--muted)"></i>No new roof</span><span><i class="beam-key"></i>Lines = beams (عروق) and their direction</span></div>' +
+      (ro ? '' : '<div class="walls" id="wallsBox" hidden><div class="small"><b>Doors &amp; windows</b> of <b id="wallsRoom" dir="auto"></b>, as drawn above</div>' +
+        '<div class="walls-grid">' + WALL_KEYS.map((k) => '<label class="wall-' + k + '"><span>' + WALL_LABEL[k] + ' wall</span><select data-wall="' + k + '">' +
+          WALL_OPTS.map((o) => '<option value="' + o[0] + '">' + o[1] + '</option>').join('') + '</select></label>').join('') +
+        '<div class="walls-room" aria-hidden="true"></div></div></div>') +
+      '<div class="legend"><span><i style="background:#F4A817"></i>Gets a new roof</span><span><i style="background:transparent;border-color:var(--muted)"></i>No new roof</span><span><i class="beam-key"></i>Lines = beams (عروق)</span>' +
+      '<span><i class="op-key" style="background:' + OPEN_INK.door + '"></i>Door</span><span><i class="op-key" style="background:' + OPEN_INK.window + '"></i>Window</span><span><i class="op-key" style="background:' + OPEN_INK.entrance + '"></i>Entrance</span></div>' +
       '<div id="planWarn"></div>' +
-      (unplaced.length ? '<div class="notice info small"><div><b>Not on the plan (no sizes):</b> <span dir="auto">' + unplaced.map((r) => esc(r.name || 'Unnamed room')).join(', ') + '</span>. Add sizes in Rooms to draw them.</div></div>' : '') +
+      (unplaced.length ? '<p class="small muted" style="margin:0">No sizes yet: <span dir="auto">' + unplaced.map((r) => esc(r.name || 'Unnamed room')).join(', ') + '</span></p>' : '') +
       '</section>';
   }
 
@@ -1661,6 +1822,7 @@
         });
       }
       g += '<rect class="rw" width="' + W + '" height="' + H + '" vector-effect="non-scaling-stroke" stroke-width="' + (sel ? 3.5 : 2) + '"/>';
+      g += openingsSvg(r, it.w, it.h, r.roof ? col.fill : '#FFFFFF');
       // dimensions inside the top and left walls
       const showDims = W > fs * 7 && H > fs * 5;
       const off = fs * 1.05;
@@ -1716,6 +1878,14 @@
     if (n) n.textContent = r ? (r.name || 'Room') + ' · beams ' + (pl && pl.rot ? '↔' : '↕') + ' ' + lenLabel(r.beamSide) + ' · planks ' + lenLabel(r.plankSide) : 'Tap a room to select it';
     if (b) b.disabled = !r;
     if (sw) sw.disabled = !r;
+    const box = $('#wallsBox');
+    if (box) {
+      box.hidden = !r || !pl;
+      if (r && pl) {
+        $('#wallsRoom').textContent = r.name || 'this room';
+        WALL_KEYS.forEach((k) => { const sel = $('[data-wall="' + k + '"]', box); if (sel) sel.value = (r.walls || {})[k] || ''; });
+      }
+    }
   }
 
   function svgPoint(e) {
@@ -1781,7 +1951,7 @@
     const moves = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] };
     S.cur.sel = g.dataset.rid;
     if (moves[e.key]) { pl.x = r2(pl.x + moves[e.key][0]); pl.y = r2(pl.y + moves[e.key][1]); }
-    else if (e.key === 'r' || e.key === 'R') pl.rot = pl.rot ? 0 : 1;
+    else if (e.key === 'r' || e.key === 'R') { pl.rot = pl.rot ? 0 : 1; const tr = s.rooms.find((x) => x.id === g.dataset.rid); if (tr) turnWalls(tr); }
     else return;
     e.preventDefault();
     touch(s);
@@ -1971,7 +2141,7 @@
       '<div class="btn-row"><button class="btn" data-act="export" data-kind="pdf">' + ICON.file + 'PDF</button><button class="btn ghost" data-act="export" data-kind="pptx">' + ICON.file + 'PowerPoint</button><button class="btn ghost" data-act="export" data-kind="png">' + ICON.download + 'Drawing image</button></div></section>' +
       statusPanel(s, true) +
       (canDelete(s) && !s.isNew ? '<section class="panel"><div class="panel-head"><h2>Delete</h2></div>' +
-        '<p class="small muted" style="margin:0">Removes the survey from the sheet and from every phone. Its photos go to the Google Drive trash, and the sheet keeps a copy in the “Deleted” tab.</p>' +
+        '<p class="small muted" style="margin:0">A copy stays in the sheet\'s “Deleted” tab.</p>' +
         '<div class="btn-row"><button class="btn danger" data-act="delete-survey">Delete survey</button></div></section>' : '');
   }
 
@@ -1984,12 +2154,14 @@
     if (!(s.rooms || []).length) miss.push('Rooms');
     if (noSize.length) miss.push('Sizes for ' + noSize.join(', '));
     if (!hasLoc(s)) miss.push('House location');
+    const badBeam = (w.rooms || []).filter((r) => r.invalid).map((r) => r.name);
     return '<section class="panel"><div class="panel-head"><h2>Check before submitting</h2></div>' +
       '<ul class="checklist">' +
       '<li class="' + (String(s.family || '').trim() ? 'ok' : 'no') + '">Family: <bdi>' + esc(s.family || '—') + '</bdi></li>' +
       '<li class="' + ((s.rooms || []).length ? 'ok' : 'no') + '">' + (s.rooms || []).length + ' rooms, ' + w.roofed + ' to roof · ' + fmtM(w.roofArea) + ' m²</li>' +
       '<li class="' + (noSize.length ? 'no' : 'ok') + '">' + (noSize.length ? 'Missing sizes: ' + esc(noSize.join(', ')) : 'All roof sizes measured') + '</li>' +
       '<li class="' + (hasLoc(s) ? 'ok' : 'no') + '">' + (hasLoc(s) ? 'Location saved' : 'House location missing (required, step 1)') + '</li>' +
+      '<li class="' + (badBeam.length ? 'no' : 'ok') + '">' + (badBeam.length ? 'Beam side over ' + fmtM(maxBeamSide()) + ' m: ' + esc(badBeam.join(', ')) + ' (step 2)' : 'Beam sides fit one beam') + '</li>' +
       '<li class="' + ((s.papers || []).length ? 'ok' : 'opt') + '">' + (s.papers || []).length + ' paper photo(s)</li>' +
       '</ul>' +
       (w.warnings.length ? '<div class="notice err small"><div>' + w.warnings.map(esc).join('<br>') + '</div></div>' : '') +
@@ -1997,7 +2169,7 @@
       '<section class="panel"><div class="panel-head"><h2>Drawing</h2></div><div class="btn-row"><button class="btn ghost" data-act="export" data-kind="png">' + ICON.download + 'Save drawing image</button></div></section>' +
       statusPanel(s, true) +
       (canDelete(s) && !s.isNew ? '<section class="panel"><div class="panel-head"><h2>Delete</h2></div>' +
-        '<p class="small muted" style="margin:0">Removes the survey from the sheet and from every phone. The sheet keeps a copy in the “Deleted” tab.</p>' +
+        '<p class="small muted" style="margin:0">A copy stays in the sheet\'s “Deleted” tab.</p>' +
         '<div class="btn-row"><button class="btn danger" data-act="delete-survey">Delete survey</button></div></section>' : '');
   }
 
@@ -2012,8 +2184,8 @@
     app().innerHTML = appbar({ back: true, eyebrow: 'From the Google Sheet', title: 'Wood rules' }) +
       '<main class="page"><div class="page-inner">' +
       '<section class="panel"><div class="panel-head"><h2>How lengths are chosen</h2></div>' +
-      '<p style="margin:0">Measured side <b>+ ' + r.allowance + ' cm</b> for the walls, then rounded <b>up</b> to the next length below. Example: 3.45 m + ' + r.allowance + ' cm = ' + fmtM(3.45 + r.allowance / 100) + ' m → <b>' + (pickLen(r.beam, 3.45, r.allowance) || '–') + ' cm</b>.</p>' +
-      '<div class="notice info small"><div>To change them, open the team Google Sheet: tab <b>Wood rules</b> (one row per length), tab <b>Settings</b> (“Add for walls”, beam spacing, plank width). Phones get changes on their next sync; in the sheet, <b>Shelter → Recalculate wood</b> updates old surveys.</div></div>' +
+      '<p style="margin:0">Beams: beam side <b>+ ' + r.beamAllowance + ' cm</b>; planks: plank side <b>+ ' + r.allowance + ' cm</b> for the walls, then rounded <b>up</b> to the next length below. Example: a 3.45 m beam side → <b>' + (pickLen(r.beam, 3.45, r.beamAllowance) || '–') + ' cm</b>. A beam side over ' + fmtM(maxBeamSide()) + ' m is invalid: make it the plank side.</p>' +
+      '<p class="small muted" style="margin:0">Change them in the Google Sheet (tabs Wood rules and Settings).</p>' +
       (r.example ? '<div class="notice warn small"><div><b>These are example lengths.</b> Delete the word “Example” from the Note column once they are yours.</div></div>' : '') +
       '<div class="small muted">Last downloaded ' + esc(fmtWhen(S.config.updatedAt)) + '</div></section>' +
       '<section class="panel"><div class="totals">' + table('Beams (عروق)', r.beam) + table('Planks (ألواح)', r.plank) + '</div>' +
@@ -2044,9 +2216,9 @@
       '<section class="panel"><div class="panel-head"><h2>You</h2><span class="status st-Submitted">' + esc(role()) + '</span></div>' +
       '<div class="me-line"><b dir="auto">' + esc(S.me.name || '') + '</b><span class="small muted">' + esc(roleHelp(role())) + '</span></div>' +
       (S.me.username ? '<div class="small">Username: <b class="data">' + esc(S.me.username) + '</b></div>' : '') +
-      '<p class="small muted" style="margin:0">' + (isAdmin() ? 'Roles are changed in Users.' : 'Your role is set by the admins (Begad and Hawary). It changes on this phone at the next sync.') + '</p>' +
+
       (CFG.demo ? '' : '<div class="btn-row"><button class="btn ghost" data-act="logout">Log out</button></div>' +
-        '<p class="small muted" style="margin:0">Use this when another person takes over this phone. Surveys stay on the phone.' + (p ? ' <b>' + p + ' item(s) are not uploaded yet: sync first, or they upload under the next person\'s name.</b>' : '') + '</p>') +
+        '<p class="small muted" style="margin:0">' + (p ? ' <b>' + p + ' item(s) are not uploaded yet: sync first, or they upload under the next person\'s name.</b>' : '') + '</p>') +
       '</section>' +
       (S.me.hasLogin && !CFG.demo ? '<form class="panel" id="pwForm" novalidate><div class="panel-head"><h2>Change password</h2></div><div class="fields">' +
         pwField('p-old', 'Current password', 'current-password', '') + pwField('p-new', 'New password', 'new-password', 'At least 8 characters.') + pwField('p-new2', 'New password again', 'new-password', '') +
@@ -2055,21 +2227,19 @@
         '<form class="panel" id="emailForm" novalidate><div class="panel-head"><h2>Email for "Forgot password"</h2></div><div class="fields">' +
         '<label class="field wide"><span>Email</span><input type="email" id="e-email" autocomplete="email" autocapitalize="off" inputmode="email" value="' + esc(S.me.email || '') + '"><small>A code comes here if you forget your password. Leave it empty if you don\'t want this.</small></label>' +
         '</div><div class="btn-row"><button class="btn ghost" type="submit">Save email</button></div></form>' : '') +
-      (CFG.demo ? '' : '<form class="panel" id="meForm" novalidate><div class="panel-head"><h2>Connection</h2></div><div class="fields">' +
-        (CFG.apiUrl
-          ? '<label class="field wide"><span>Sheet connection link</span><input type="url" id="m-api" readonly value="' + esc(apiUrl()) + '"><small>Set for the whole team in config.js on the website.</small></label>'
-          : '<label class="field wide"><span>Sheet connection link</span><input type="url" id="m-api" autocapitalize="off" value="' + esc(S.me.api || '') + '"></label>') +
-        '</div>' + (CFG.apiUrl ? '' : '<div class="btn-row"><button class="btn" type="submit">Save</button></div>') + '</form>') +
+      (CFG.demo || CFG.apiUrl || !isAdmin() ? '' : '<form class="panel" id="meForm" novalidate><div class="panel-head"><h2>Connection</h2></div><div class="fields">' +
+        '<label class="field wide"><span>Sheet connection link</span><input type="url" id="m-api" autocapitalize="off" value="' + esc(S.me.api || '') + '"><small>Better: put it in config.js on the website, for everyone.</small></label>' +
+        '</div><div class="btn-row"><button class="btn" type="submit">Save</button></div></form>') +
       '<section class="panel"><div class="panel-head"><h2>Sync</h2>' + syncPillHtml() + '</div>' +
       '<div class="small">' + S.surveys.size + ' surveys on this phone · ' + p + ' waiting to upload · last sync ' + esc(fmtWhen(S.lastSyncAt ? new Date(S.lastSyncAt).toISOString() : '')) + '</div>' +
       (S.sync.msg ? '<div class="notice ' + (S.sync.state === 'offline' ? 'warn' : 'err') + ' small"><div>' + esc(S.sync.msg) + '</div></div>' : '') +
       '<div class="btn-row"><button class="btn ghost" data-act="sync-now">Sync now</button></div></section>' +
       (isMgr() && !CFG.demo ? '<section class="panel"><div class="panel-head"><h2>Invite people</h2></div>' +
-        '<p class="small muted" style="margin:0">Send this link in the team WhatsApp group. It opens the app connected to the sheet with the team code filled in; each person makes their own account (name, username, password).' + (S.teamCode ? ' Team code: <b class="data">' + esc(S.teamCode) + '</b>.' : '') + '</p>' +
+        '<p class="small muted" style="margin:0">For the team WhatsApp group.' + (S.teamCode ? ' Team code: <b class="data">' + esc(S.teamCode) + '</b>' : '') + '</p>' +
         '<div class="btn-row"><button class="btn ghost" data-act="copy-invite">Copy invite link</button></div><input type="text" id="inviteText" readonly hidden></section>' : '') +
       (isStandalone() ? '' : '<section class="panel"><div class="panel-head"><h2>Install</h2></div>' + installHelp(false) + '</section>') +
       '<section class="panel"><div class="panel-head"><h2>Reset this phone</h2></div>' +
-      '<p class="small muted" style="margin:0">Removes all surveys and photos from this phone and logs out. Surveys already in the sheet are safe.' + (p ? ' <b>' + p + ' items are not uploaded yet and would be lost.</b>' : '') + '</p>' +
+      '<p class="small muted" style="margin:0">Clears this phone and logs out. The sheet keeps everything uploaded.' + (p ? ' <b>' + p + ' items are not uploaded yet and would be lost.</b>' : '') + '</p>' +
       '<div class="btn-row"><button class="btn danger" data-act="reset">Reset this phone</button></div>' +
       '<div class="small muted">Shelter Surveys ' + APP_VERSION + '</div></section>' +
       '</div></main>';
@@ -2237,7 +2407,7 @@
       (all.length ? '<section class="panel"><div class="panel-head"><h2>' + roofed + ' of ' + all.length + ' roofed</h2>' +
         '<button class="btn ghost sm" data-snap="team">📷 Team picture</button></div>' +
         '<div class="progress big"><i style="width:' + Math.round(roofed / all.length * 100) + '%"></i></div>' +
-        '<p class="small muted" style="margin:0">Marks work without internet; they upload when you are back online.</p></section>' : '') +
+        '</section>' : '') +
       (days.length ? days.map((x) => {
         const done = x.houses.filter((s) => s.status === 'Roofed').length;
         return '<h2 class="list-title">' + ICON.calendar + '<bdi>' + esc(x.t.name) + '</bdi> <span class="muted small">' + esc(fmtDay(x.t.date)) + ' · ' + done + '/' + x.houses.length + '</span></h2>' +
@@ -2423,7 +2593,7 @@
       '<div id="snapTools" hidden>' +
       '<label class="field wide"><span>Caption</span><input type="text" id="snapCaption" maxlength="80" dir="auto" placeholder="' + (kind === 'roof' ? 'Done! Another dry home' : 'Say something') + '"></label>' +
       '<div class="sticker-bar" role="group" aria-label="Stickers">' + STICKERS.map((e) => '<button type="button" class="sticker-btn" data-sticker="' + e + '">' + e + '</button>').join('') + '</div>' +
-      '<p class="small muted" style="margin:0">Tap a sticker to add it, drag it on the photo, tap it there to remove it.</p></div>' +
+      '<p class="small muted" style="margin:0">Tap a sticker, then drag it.</p></div>' +
       '<div id="snapMsg"></div>' +
       '<div class="btn-row"><button class="btn leaf" data-act="snap-send" id="snapSend" disabled>Send</button><button class="btn quiet" data-act="close-sheet">Cancel</button></div></div>');
     $('#snapFile').addEventListener('change', async (e) => {
@@ -2674,6 +2844,10 @@
     } else toast((s.family || 'House') + ': ' + (state === 'Roofed' ? 'roofed' : 'pending'));
   }
 
+  /** Notes of each room ("Hall: crack in the left wall"), then the survey's own notes. */
+  const roomNotes = (s) => (s.rooms || []).filter((r) => String(r.notes || '').trim()).map((r) => (r.name || 'Room') + ': ' + String(r.notes).trim());
+  const notesText = (s) => roomNotes(s).concat(String(s.notes || '').trim() ? [String(s.notes).trim()] : []).join('  ·  ');
+
   /** The house location is required before a survey leaves Draft. */
   const leavesDraft = (s, to) => (s.status || 'Draft') === 'Draft' && to !== 'Draft' && to !== 'Cancelled';
   function askForLocation(s) {
@@ -2684,8 +2858,36 @@
     if (p) { p.classList.add('needed'); p.scrollIntoView({ block: 'center' }); }
   }
 
+  /** A beam side over 6 m (with the walls) can't be submitted: back to the Rooms step, the room highlighted. */
+  function askForWood(s) {
+    toast('A beam side is too long. Beams can\'t be more than ' + fmtM(maxBeamSide()) + ' m: make it the plank side.', 5000);
+    S.cur.step = 1; S.stepOf[s.id] = 1;
+    renderEditor(s.id);
+    const bad = $('.room-bad');
+    if (bad) { bad.closest('.room').classList.add('needed'); bad.scrollIntoView({ block: 'center' }); }
+  }
+  /** Submit for review, if the location is saved and every beam fits. */
+  function trySubmit(s) {
+    if (!s || !canEdit(s)) return false;
+    if (!hasLoc(s)) { askForLocation(s); return false; }
+    if (woodInvalid(s)) { askForWood(s); return false; }
+    s.status = 'Submitted'; touch(s); toast('Submitted for review ✓', 3000);
+    return true;
+  }
+  /** Your own survey, still a draft: only you see it, and the app reminds you to submit it. */
+  const isMyDraft = (s) => !!s && (s.status || 'Draft') === 'Draft' && canEdit(s) && isOwner(s);
+  const worthSubmitting = (s) => isMyDraft(s) && !!(String(s.family || '').trim() || (s.rooms || []).length);
+  function showLeaveSheet(s) {
+    showSheet('<div class="leave-sheet"><h2>Not submitted yet</h2>' +
+      '<p style="margin:0"><b dir="auto">' + esc(s.family || 'This survey') + '</b> is still a <b>draft</b>. Nobody else sees it until you submit it.</p>' +
+      '<div class="btn-stack"><button class="btn leaf big-submit" data-act="leave-submit">' + ICON.check + 'Submit for review</button>' +
+      '<button class="btn ghost" data-act="leave-draft">Save as draft and leave</button>' +
+      '<button class="btn quiet" data-act="close-sheet">Keep editing</button></div></div>');
+  }
+
   function setStatus(s, to) {
     if (leavesDraft(s, to) && !hasLoc(s)) { askForLocation(s); return; }
+    if (leavesDraft(s, to) && woodInvalid(s)) { askForWood(s); return; }
     if (isLeader() && (to === 'Roofed' || to === 'Pending')) { markHouse(s, to); return; }
     if (to === s.status) return;
     s.status = to;
@@ -2715,8 +2917,7 @@
     app().innerHTML = appbar({ eyebrow: 'Lebaladna · Shelter · ' + (S.me.name || '') + ' (' + role() + ')', title: 'Users', wide: true,
       actions: '<button class="iconbtn" data-act="go-me" aria-label="Settings">' + ICON.gear + '</button>' }) +
       '<main class="page wide"><div class="page-inner">' + navTabs('users') +
-      '<div class="notice info small"><div>People make their own account in the app with the team code' + (S.teamCode ? ' <b class="data">' + esc(S.teamCode) + '</b>' : '') +
-      ' and start as Researchers. Tap a person ' + (isAdmin() ? 'to make them Team leader or Manager, to make a password code, or to merge a double account.' : 'who forgot their password to make them a one-time code.') + '</div></div>' +
+      '<p class="small muted" style="margin:0">' + (isAdmin() ? 'Tap a person to change their role, make a password code, or merge a double account.' : 'Tap a person who forgot their password.') + '</p>' +
       (navigator.onLine === false ? '<div class="notice warn small"><div>Offline. This screen needs internet.</div></div>' : '') +
       (waiting.length ? '<section class="panel wait-panel"><div class="panel-head"><h2>⏳ Waiting to be let in <span class="badge">' + waiting.length + '</span></h2></div>' +
         '<p class="small muted" style="margin:0">They logged in with the team code. Let in only people you know; they then see all surveys, including national IDs.</p>' +
@@ -2770,11 +2971,11 @@
           '<button type="button" class="role-btn' + (u.role === r ? ' on' : '') + '" data-setrole="' + esc(r) + '"' + (u.role === r ? ' aria-pressed="true"' : '') + '><b>' + esc(r) + '</b><span>' + esc(roleHelp(r)) + '</span></button>').join('') + '</div>'
         : '') +
       (canResetFor(u) ? '<section class="sheet-part"><h3>Forgot their password?</h3>' +
-        '<p class="small muted" style="margin:0">Make a one-time code (24 hours) and send it on WhatsApp. They open the app → Forgot password → type their username, the code and a new password.</p>' +
+        '<p class="small muted" style="margin:0">A one-time code for 24 hours. They use it in Forgot password.</p>' +
         (u.username ? '' : '<label class="field wide"><span>Username for them</span><input type="text" id="u-username" autocapitalize="off" spellcheck="false" value="' + esc(suggestUsername(u.name)) + '"><small>They have none yet (from before 1.7).</small></label>') +
         '<div class="btn-row"><button type="button" class="btn ghost" data-act="make-code">Make a code</button></div><div id="u-code-out"></div></section>' : '') +
       (isAdmin() && u.id !== S.me.id && others.length ? '<section class="sheet-part"><h3>Same person twice?</h3>' +
-        '<p class="small muted" style="margin:0">Moves <b dir="auto">' + esc(u.name) + '</b>\'s surveys, team houses, days and photos into the other account, then switches this one off. Their phones keep working as the other account.</p>' +
+        '<p class="small muted" style="margin:0">Moves everything of <b dir="auto">' + esc(u.name) + '</b> into the account you keep, then switches this one off.</p>' +
         '<label class="field wide"><span>Keep this account</span><select id="u-merge"><option value="">Choose…</option>' + others.map((x) => '<option value="' + esc(x.id) + '">' + esc(x.name + (x.username ? ' (@' + x.username + ')' : '') + ' · ' + x.role) + '</option>').join('') + '</select></label>' +
         '<div class="btn-row"><button type="button" class="btn ghost" data-act="merge-user">Merge into it</button></div></section>' : '') +
       '<div id="u-msg"></div>' +
@@ -2865,7 +3066,7 @@
       const res = await api('getHistory', { surveyId: s.id }, 45000);
       const rows = res.history || [];
       S.histFor = s.id;
-      showSheet('<h2>History</h2><p class="small muted" style="margin:0"><bdi>' + esc((s.code || '') + ' · ' + (s.family || '')) + '</bdi> · newest first. The sheet keeps a full copy before and after each change (tab “History”).</p>' +
+      showSheet('<h2>History</h2><p class="small muted" style="margin:0"><bdi>' + esc((s.code || '') + ' · ' + (s.family || '')) + '</bdi> · newest first</p>' +
         (rows.length ? '<ol class="history">' + rows.map((h) => {
           const d = fieldDiffs(h.before, h.after);
           const table = d.length && h.before ? '<table class="diff"><thead><tr><th>What</th><th>Before</th><th>After</th></tr></thead><tbody>' +
@@ -2922,9 +3123,8 @@
   }
 
   function inviteLink(code) {
-    let link = location.origin + location.pathname + '?api=' + encodeURIComponent(apiUrl());
-    if (code) link += '&code=' + encodeURIComponent(code);
-    return link;
+    const q = (CFG.apiUrl ? [] : ['api=' + encodeURIComponent(apiUrl())]).concat(code ? ['code=' + encodeURIComponent(code)] : []);
+    return location.origin + location.pathname + (q.length ? '?' + q.join('&') : '');
   }
   async function copyText(text, box) {
     try { await navigator.clipboard.writeText(text); toast('Copied'); return true; }
@@ -3061,8 +3261,10 @@
     const w = s ? calcWood(s.rooms, S.config.rules) : null;
     const joint = w && w.rooms.some((r) => r.plankParts === 2);
     const support = w && w.rooms.some((r) => r.beamParts === 2);
-    return 'Sizes: measured → wood to buy in cm (+' + normRules(S.config.rules).allowance + ' cm for the walls)  ·  Lines = beams (عروق)' +
-      (joint ? '  ·  Bold beam = planks meet' : '') + (support ? '  ·  Red dashes = support where beams meet' : '') + '  ·  Wood in cm × pieces';
+    const nr = normRules(S.config.rules);
+    return 'Sizes: measured → wood to buy in cm (beams +' + nr.beamAllowance + ', planks +' + nr.allowance + ' cm for the walls)  ·  Lines = beams (عروق)' +
+      (joint ? '  ·  Bold beam = planks meet' : '') + (support ? '  ·  Red dashes = support where beams meet' : '') +
+      (s && s.rooms.some((r) => r.walls && Object.keys(r.walls).length) ? '  ·  Brown = door, blue = window, green arrow = entrance' : '') + '  ·  Wood in cm × pieces';
   }
 
   function drawPlanCanvas(ctx, s, box) {
@@ -3077,6 +3279,7 @@
     const rules = normRules(S.config.rules);
     const wood = calcWood(s.rooms, rules);
     const b = bounds(items);
+    if (s.rooms.some((r) => WALL_KEYS.some((kk) => (r.walls || {})[kk] === 'entrance'))) { b.x1 -= 0.8; b.y1 -= 0.8; b.x2 += 0.8; b.y2 += 0.8; } // room for "Entrance" outside
     const bw = b.x2 - b.x1, bh = b.y2 - b.y1;
     const k = Math.min((box.w * 0.96) / bw, (box.h * 0.9) / bh, 170);
     const ox = box.x + (box.w - bw * k) / 2, oy = box.y + (box.h - bh * k) / 2;
@@ -3107,6 +3310,7 @@
       }
       ctx.lineWidth = r.roof ? 5 : 3; ctx.strokeStyle = r.roof ? '#1D2428' : '#8A969C';
       ctx.strokeRect(x, y, w, h);
+      drawOpeningsCanvas(ctx, r, x, y, k, it.w, it.h, fill);
       const fs = clamp(Math.min(w, h) * 0.11, 22, 40);
       const off = fs * 1.15;
       const roomy = w > fs * 5 && h > fs * 4;
@@ -3201,7 +3405,8 @@
     const showQr = hasLoc(s) && !!window.qrcode;
     const qrSize = 230;
     const totalsH = (2 + Math.max(1, Object.keys(w.beams).length) + Math.max(1, Object.keys(w.planks).length)) * rowH + 52 + 40 + (showQr ? qrSize + 110 : 0);
-    const extraLines = w.warnings.length + w.notes.length * 2 + (rules.example ? 1 : 0) + (s.notes ? 2 : 0);
+    const allNotes = notesText(s);
+    const extraLines = w.warnings.length + w.notes.length * 2 + (rules.example ? 1 : 0) + (allNotes ? 2 + roomNotes(s).length : 0);
     const footerH = 110;
     const planTop = top + 50;
     const planBottom = Math.min(H * 0.72, H - m - footerH - Math.max(tableH, totalsH) - 150 - extraLines * 36);
@@ -3267,9 +3472,9 @@
     if (rules.example) warnLines.unshift('Wood uses EXAMPLE rules – confirm before buying.');
     warnLines.forEach((t) => { setFont(ctx, 26, 600); ctx.fillStyle = '#B42318'; ny = wrapText(ctx, t, m, ny, W - 2 * m, 34, 2) + 38; });
     w.notes.forEach((t) => { setFont(ctx, 26, 600); ctx.fillStyle = '#A9500F'; ny = wrapText(ctx, t + '.', m, ny, W - 2 * m, 34, 2) + 38; });
-    if (s.notes) {
+    if (allNotes) {
       setFont(ctx, 26, 400); ctx.fillStyle = '#1D2428';
-      wrapText(ctx, 'Notes: ' + s.notes, m, ny, W - 2 * m, 34, Math.max(1, Math.floor((H - m - footerH - ny) / 34)));
+      wrapText(ctx, 'Notes: ' + allNotes, m, ny, W - 2 * m, 34, Math.max(1, Math.floor((H - m - footerH - ny) / 34)));
     }
     // footer: what the drawing shows, then the print date
     ctx.fillStyle = '#5D6A71'; ctx.textAlign = 'left';
@@ -3530,7 +3735,7 @@
     w.notes.forEach((t) => foot.push({ text: t + '.  ', options: { color: 'A9500F', bold: true } }));
     foot.push({ text: legendText(s) + '  ·  printed ' + today(), options: { color: '5D6A71' } });
     slide.addText(foot, { x: 0.4, y: 12.25, w: 6.7, h: 0.9, fontFace: 'Arial', fontSize: 8, margin: 0, valign: 'bottom', isTextBox: true });
-    if (s.notes) slide.addNotes(s.notes);
+    if (notesText(s)) slide.addNotes(notesText(s));
   }
 
   function summarySlide(pres, list, logoData, opts) {
@@ -3814,11 +4019,32 @@
       case 'snap-send': sendSnap(); break;
       case 'check-again': checkAgain(false); break;
       case 'submit-survey':
-        if (s && canEdit(s)) {
-          if (!hasLoc(s)) { askForLocation(s); break; }
-          s.status = 'Submitted'; touch(s); toast('Submitted for review ✓'); go(S.backTo || '');
-        }
+        if (trySubmit(s)) { S.leaveOk = true; go(S.backTo || ''); }
         break;
+      case 'leave-submit': {
+        const ls = S.cur && S.surveys.get(S.cur.id);
+        closeSheet();
+        if (trySubmit(ls)) { S.leaveOk = true; go(S.leaveTo || ''); }
+        break;
+      }
+      case 'leave-draft':
+        S.leaveOk = true; closeSheet(); toast('Saved as a draft: not submitted'); go(S.leaveTo || '');
+        break;
+      case 'swap-sides': { // in the room card: an invalid beam side becomes the plank side
+        const card = actEl.closest('.room');
+        const r = s && card && s.rooms.find((x) => x.id === card.dataset.rid);
+        if (!r || !canEdit(s)) break;
+        const tmp = r.beamSide; r.beamSide = r.plankSide; r.plankSide = tmp;
+        const pl = s.layout && s.layout.rooms[r.id];
+        if (pl) pl.rot = pl.rot ? 0 : 1; // same outline on the plan
+        touch(s);
+        const bi = $('#rb-' + r.id), pi = $('#rp-' + r.id);
+        if (bi) bi.value = fmtM(r.beamSide); if (pi) pi.value = fmtM(r.plankSide);
+        card.classList.remove('needed');
+        refreshRoomWood(s);
+        toast('Swapped: beams ' + fmtM(r.beamSide) + ' m, planks ' + fmtM(r.plankSide) + ' m');
+        break;
+      }
       case 'delete-picked': {
         const n = Array.from(S.list.picked).map((id) => S.surveys.get(id)).filter((x) => x && canDelete(x)).length;
         if (removeArm.get('picked')) { removeArm.delete('picked'); deletePicked(); }
@@ -3875,7 +4101,7 @@
         showSheet('<h2>Sync</h2><p style="margin:0"><b>' + esc(i.text) + '</b></p>' +
           '<p class="small muted" style="margin:0">' + pendingCount() + ' item(s) waiting · last sync ' + esc(fmtWhen(S.lastSyncAt ? new Date(S.lastSyncAt).toISOString() : '')) + '</p>' +
           (S.sync.msg ? '<div class="notice ' + (S.sync.state === 'offline' || S.sync.state === 'wait' ? 'warn' : 'err') + ' small"><div>' + esc(S.sync.msg) + '</div></div>' : '') +
-          '<p class="small muted" style="margin:0">Everything is kept on this phone until it reaches the sheet. Open the app when you have internet and it uploads by itself.</p>' +
+          '<p class="small muted" style="margin:0">Kept on this phone until it uploads.</p>' +
           '<div class="btn-row">' + (CFG.demo ? '' : '<button class="btn" data-act="sync-now">Sync now</button>') + '<button class="btn quiet" data-act="close-sheet">Close</button></div>');
         break;
       }
@@ -3908,7 +4134,7 @@
       case 'rotate': {
         if (!s || !S.cur.sel || !canEdit(s)) break;
         const pl = s.layout.rooms[S.cur.sel];
-        if (pl) { pl.rot = pl.rot ? 0 : 1; touch(s); renderPlan(); }
+        if (pl) { pl.rot = pl.rot ? 0 : 1; const tr = s.rooms.find((x) => x.id === S.cur.sel); if (tr) turnWalls(tr); touch(s); renderPlan(); }
         break;
       }
       case 'tidy': if (s && canEdit(s)) { tidyLayout(s); touch(s); renderPlan(); } break;
@@ -3983,6 +4209,11 @@
       return;
     }
     if (t.matches('[data-statuspick]') && s) { setStatus(s, t.value); return; }
+    if (t.matches('[data-wall]') && s && S.cur && S.cur.sel && canEdit(s)) {
+      const r = s.rooms.find((x) => x.id === S.cur.sel);
+      if (r) { setWall(s, r, t.dataset.wall, t.value); touch(s); renderPlan(); }
+      return;
+    }
     if (t.matches('[data-hleader]') && S.dayDraft) {
       if (t.value) S.dayDraft.houseLeaders[t.dataset.hleader] = t.value; else delete S.dayDraft.houseLeaders[t.dataset.hleader];
       return;
@@ -4070,6 +4301,7 @@
       const cfg = await DB.meta('config');
       if (cfg && cfg.rules) S.config = cfg;
       S.lastPull = (await DB.meta('lastPull')) || '';
+      S.dataEpoch = (await DB.meta('dataEpoch')) || '';
       S.lastSyncAt = (await DB.meta('lastSyncAt')) || 0;
       S.pendingDeletes = (await DB.meta('pendingDeletes')) || [];
       S.pendingStates = (await DB.meta('pendingStates')) || [];
@@ -4082,6 +4314,7 @@
       (await DB.all('surveys')).forEach((s) => { if (!s.isNew) S.surveys.set(s.id, s); });
     } catch (e) { /* start empty */ }
     readInvite();
+    if (S.invite && CFG.apiUrl) S.invite.api = ''; // config.js decides the sheet: an invite link can't change it
     if (S.invite && S.me && S.invite.api) {
       S.me = Object.assign({}, S.me, { api: cleanApi(S.invite.api) });
       DB.setMeta('me', S.me).catch(() => {});
