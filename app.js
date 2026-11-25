@@ -13,7 +13,7 @@
     pptx: 'pptxgen.bundle.js',
     qr: 'qrcode.js'
   }, CFG.assets || {});
-  const APP_VERSION = '1.8.0';
+  const APP_VERSION = '1.8.1';
 
   const STATUSES = ['Draft', 'Submitted', 'Reviewed', 'Approved', 'Roofed', 'Cancelled'];
   const ROLES = ['Admin', 'Manager', 'Team leader', 'Researcher']; // researchers also review
@@ -667,6 +667,7 @@
       rules: hasRules ? rules : Object.assign({}, DEFAULT_RULES, rules, { beam: DEFAULT_RULES.beam, plank: DEFAULT_RULES.plank, example: true }),
       papers: c.papers && c.papers.length ? c.papers : DEFAULT_PAPERS,
       project: c.project || '',
+      locationRequired: c.locationRequired !== false,
       updatedAt: res.serverTime || nowIso()
     };
     await DB.setMeta('config', S.config);
@@ -1417,23 +1418,66 @@
   const mapsLink = (L) => 'https://www.google.com/maps/search/?api=1&query=' + fix6(L.lat) + ',' + fix6(L.lng);
   const navLink = (L) => 'https://www.google.com/maps/dir/?api=1&destination=' + fix6(L.lat) + ',' + fix6(L.lng);
   const hasLoc = (s) => !!(s && s.location && isFinite(s.location.lat) && isFinite(s.location.lng));
+  /** Settings tab "House location required" (Yes by default). */
+  const locRequired = () => !(S.config && S.config.locationRequired === false);
+
+  /**
+   * Coordinates from a Google Maps link or text: the place pin (!3d…!4d…), ?q= / ?query= / ?ll= / ?destination=,
+   * @lat,lng (map centre), geo:lat,lng or plain "30.5965, 32.2715". Short share links are opened by the sheet first.
+   */
+  function parseMapsLink(text) {
+    let t = String(text || '').trim().replace(/[\u0660-\u0669]/g, (d) => String(d.charCodeAt(0) - 0x660));
+    try { t = decodeURIComponent(t); } catch (e) { /* keep as typed */ }
+    const n = '(-?\\d{1,3}(?:\\.\\d+)?)';
+    const pick = (a, b) => { const lat = +a, lng = +b; return Math.abs(lat) <= 90 && Math.abs(lng) <= 180 && (lat || lng) ? { lat, lng } : null; };
+    const forms = [
+      new RegExp('!3d' + n + '!4d' + n),
+      new RegExp('[?&](?:q|query|ll|destination|daddr|center)=(?:loc:)?' + n + ',\\s*\\+?' + n),
+      new RegExp('@' + n + ',' + n),
+      new RegExp('^(?:geo:)?' + n + '\\s*[,،]\\s*' + n + '\\s*$')
+    ];
+    for (const re of forms) { const m = t.match(re); if (m) return pick(m[1], m[2]); }
+    return null;
+  }
+  const SHORT_MAPS = /^https:\/\/(maps\.app\.goo\.gl|goo\.gl\/maps)\/[\w-]+/;
+  async function locationFromLink(s) {
+    const box = $('#locLink');
+    let text = box ? box.value.trim() : '';
+    if (!text) { toast('Paste a Google Maps link or the coordinates'); return; }
+    if (SHORT_MAPS.test(text)) { // a share link from the Maps app: the sheet opens it to find the place
+      if (CFG.demo || navigator.onLine === false) { toast('Short links need internet. Paste the long link or the coordinates.', 4000); return; }
+      try { text = (await api('resolveMapLink', { url: text }, 25000)).url || ''; }
+      catch (e) { toast('That link could not be opened. Paste the long link or the coordinates.', 4000); return; }
+    }
+    const p = parseMapsLink(text);
+    if (!p) { toast('No location found in that link', 3500); return; }
+    if (!(p.lat > 21 && p.lat < 32.5 && p.lng > 24 && p.lng < 37.5)) toast('Note: that place is outside Egypt. Check the link.', 4500);
+    s.location = { lat: Math.round(p.lat * 1e6) / 1e6, lng: Math.round(p.lng * 1e6) / 1e6, acc: 0, at: nowIso() };
+    delete s.locationCleared;
+    touch(s);
+    renderEditor(s.id);
+    toast('Location saved from the link');
+  }
+  const linkField = () => '<div class="code-row loc-link"><input type="text" id="locLink" inputmode="url" autocapitalize="off" spellcheck="false" placeholder="…or paste a Google Maps link">' +
+    '<button type="button" class="btn ghost sm" data-act="loc-link">Use link</button></div>';
 
   function locationHtml(s, ro) {
     const L = hasLoc(s) ? s.location : null;
     let inner;
     if (L) {
       inner = '<div class="loc"><div class="loc-coords"><b class="data">' + fix6(L.lat) + ', ' + fix6(L.lng) + '</b>' +
-        '<span class="small muted">' + (L.acc ? 'accurate to ± ' + Math.round(L.acc) + ' m · ' : '') + 'saved ' + esc(fmtWhen(L.at)) + '</span></div>' +
+        '<span class="small muted">' + (L.acc ? 'accurate to ± ' + Math.round(L.acc) + ' m · ' : 'from a Maps link · ') + 'saved ' + esc(fmtWhen(L.at)) + '</span></div>' +
         '<div class="btn-row"><a class="btn sm" href="' + navLink(L) + '" target="_blank" rel="noopener noreferrer">' + ICON.pin + 'Navigate</a>' +
         '<a class="btn ghost sm" href="' + mapsLink(L) + '" target="_blank" rel="noopener noreferrer">Open in Maps</a>' +
-        (ro ? '' : '<button class="btn quiet sm" data-act="gps">Save again</button>' + ((s.status || 'Draft') === 'Draft' ? '<button class="btn quiet sm" data-act="gps-clear">Remove</button>' : '')) + '</div></div>';
+        (ro ? '' : '<button class="btn quiet sm" data-act="gps">Save again</button>' + ((s.status || 'Draft') === 'Draft' ? '<button class="btn quiet sm" data-act="gps-clear">Remove</button>' : '')) + '</div></div>' +
+        (ro ? '' : linkField());
     } else if (ro) {
       inner = '<p class="small muted" style="margin:0">No location saved for this house.</p>';
     } else {
-      inner = '<p class="small muted" style="margin:0"><b>Required.</b> Tap it at the house door.</p>' +
-        '<div class="btn-row"><button class="btn ghost" data-act="gps">' + ICON.pin + 'Save house location</button></div>';
+      inner = '<p class="small muted" style="margin:0">' + (locRequired() ? '<b>Required.</b> ' : '') + 'Tap it at the house door, or paste a Google Maps link.</p>' +
+        '<div class="btn-row"><button class="btn ghost" data-act="gps">' + ICON.pin + 'Save house location</button></div>' + linkField();
     }
-    return '<section class="panel" id="locPanel"><div class="panel-head"><h2>House location' + (L ? '' : ' <span class="req">required</span>') + '</h2></div>' + inner + '<div id="gpsMsg"></div></section>';
+    return '<section class="panel" id="locPanel"><div class="panel-head"><h2>House location' + (L || !locRequired() ? '' : ' <span class="req">required</span>') + '</h2></div>' + inner + '<div id="gpsMsg"></div></section>';
   }
 
   let gpsWatch = null;
@@ -2153,14 +2197,14 @@
     if (!String(s.family || '').trim()) miss.push('Head of family');
     if (!(s.rooms || []).length) miss.push('Rooms');
     if (noSize.length) miss.push('Sizes for ' + noSize.join(', '));
-    if (!hasLoc(s)) miss.push('House location');
+    if (!hasLoc(s) && locRequired()) miss.push('House location');
     const badBeam = (w.rooms || []).filter((r) => r.invalid).map((r) => r.name);
     return '<section class="panel"><div class="panel-head"><h2>Check before submitting</h2></div>' +
       '<ul class="checklist">' +
       '<li class="' + (String(s.family || '').trim() ? 'ok' : 'no') + '">Family: <bdi>' + esc(s.family || '—') + '</bdi></li>' +
       '<li class="' + ((s.rooms || []).length ? 'ok' : 'no') + '">' + (s.rooms || []).length + ' rooms, ' + w.roofed + ' to roof · ' + fmtM(w.roofArea) + ' m²</li>' +
       '<li class="' + (noSize.length ? 'no' : 'ok') + '">' + (noSize.length ? 'Missing sizes: ' + esc(noSize.join(', ')) : 'All roof sizes measured') + '</li>' +
-      '<li class="' + (hasLoc(s) ? 'ok' : 'no') + '">' + (hasLoc(s) ? 'Location saved' : 'House location missing (required, step 1)') + '</li>' +
+      '<li class="' + (hasLoc(s) ? 'ok' : locRequired() ? 'no' : 'opt') + '">' + (hasLoc(s) ? 'Location saved' : locRequired() ? 'House location missing (required, step 1)' : 'No house location (optional)') + '</li>' +
       '<li class="' + (badBeam.length ? 'no' : 'ok') + '">' + (badBeam.length ? 'Beam side over ' + fmtM(maxBeamSide()) + ' m: ' + esc(badBeam.join(', ')) + ' (step 2)' : 'Beam sides fit one beam') + '</li>' +
       '<li class="' + ((s.papers || []).length ? 'ok' : 'opt') + '">' + (s.papers || []).length + ' paper photo(s)</li>' +
       '</ul>' +
@@ -2869,7 +2913,7 @@
   /** Submit for review, if the location is saved and every beam fits. */
   function trySubmit(s) {
     if (!s || !canEdit(s)) return false;
-    if (!hasLoc(s)) { askForLocation(s); return false; }
+    if (!hasLoc(s) && locRequired()) { askForLocation(s); return false; }
     if (woodInvalid(s)) { askForWood(s); return false; }
     s.status = 'Submitted'; touch(s); toast('Submitted for review ✓', 3000);
     return true;
@@ -2886,7 +2930,7 @@
   }
 
   function setStatus(s, to) {
-    if (leavesDraft(s, to) && !hasLoc(s)) { askForLocation(s); return; }
+    if (leavesDraft(s, to) && !hasLoc(s) && locRequired()) { askForLocation(s); return; }
     if (leavesDraft(s, to) && woodInvalid(s)) { askForWood(s); return; }
     if (isLeader() && (to === 'Roofed' || to === 'Pending')) { markHouse(s, to); return; }
     if (to === s.status) return;
@@ -4072,6 +4116,7 @@
         break;
       }
       case 'gps': if (s && canEdit(s)) captureLocation(s); break;
+      case 'loc-link': if (s && canEdit(s)) await locationFromLink(s); break;
       case 'gps-clear': {
         if (!s || !canEdit(s)) break;
         s.location = null; s.locationCleared = true; touch(s);
